@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -14,6 +15,8 @@ import (
 )
 
 const notesDir = "notes"
+
+var noteLinkPattern = regexp.MustCompile(`\[\[([^\[\]]+)\]\]`)
 
 var now = time.Now
 
@@ -273,15 +276,39 @@ func viewNote(args []string) error {
 		return errors.New("view requires a note id")
 	}
 
-	data, err := os.ReadFile(notePath(args[0]))
+	id := args[0]
+	path := notePath(id)
+
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("note %q not found", args[0])
+			return fmt.Errorf("note %q not found", id)
 		}
 		return err
 	}
 
+	content := parseNoteContent(path, string(data))
+	links := extractNoteLinks(content.Body)
+	backlinks, err := findBacklinks(id)
+	if err != nil {
+		return err
+	}
+
 	fmt.Print(string(data))
+	if len(links) == 0 && len(backlinks) == 0 {
+		return nil
+	}
+
+	if !strings.HasSuffix(string(data), "\n") {
+		fmt.Println()
+	}
+	fmt.Println()
+	if len(links) > 0 {
+		fmt.Printf("Links: %s\n", strings.Join(links, ", "))
+	}
+	if len(backlinks) > 0 {
+		fmt.Printf("Backlinks: %s\n", strings.Join(backlinks, ", "))
+	}
 	return nil
 }
 
@@ -539,6 +566,62 @@ func formatNote(note noteContent) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+func extractNoteLinks(body string) []string {
+	matches := noteLinkPattern.FindAllStringSubmatch(body, -1)
+	seen := make(map[string]struct{})
+	var links []string
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		id := strings.TrimSpace(match[1])
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		links = append(links, id)
+	}
+	return links
+}
+
+func findBacklinks(targetID string) ([]string, error) {
+	notes, err := loadNotes()
+	if err != nil {
+		return nil, err
+	}
+
+	var backlinks []string
+	for _, note := range notes {
+		if note.ID == targetID {
+			continue
+		}
+
+		content, err := readNoteContent(notePath(note.ID))
+		if err != nil {
+			return nil, err
+		}
+
+		if containsLink(extractNoteLinks(content.Body), targetID) {
+			backlinks = append(backlinks, note.ID)
+		}
+	}
+
+	sort.Strings(backlinks)
+	return backlinks, nil
+}
+
+func containsLink(links []string, targetID string) bool {
+	for _, link := range links {
+		if link == targetID {
+			return true
+		}
+	}
+	return false
 }
 
 func slugify(input string) string {

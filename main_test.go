@@ -829,6 +829,67 @@ func TestRunIncludesArchiveCommands(t *testing.T) {
 	}
 }
 
+func TestExtractNoteLinksDeduplicatesAndPreservesOrder(t *testing.T) {
+	body := "See [[project-log]] and [[daily-log]]. Repeat [[project-log]] and ignore [[]]."
+
+	got := extractNoteLinks(body)
+	want := []string{"project-log", "daily-log"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("unexpected links: got %v want %v", got, want)
+	}
+}
+
+func TestViewNoteShowsLinksAndBacklinks(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("target"), []byte("# Target\n\nLinks to [[other-note]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("source-a"), []byte("# Source A\n\nPoints at [[target]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("source-b"), []byte("# Source B\nArchived: true\n\nAlso points at [[target]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := viewNote([]string{"target"}); err != nil {
+			t.Fatalf("viewNote returned error: %v", err)
+		}
+	})
+
+	want := "# Target\n\nLinks to [[other-note]].\n\nLinks: other-note\nBacklinks: source-a, source-b\n"
+	if output != want {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestViewNotePrintsRawMarkdownWhenNoLinkMetadataExists(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("solo"), []byte("# Solo\n\nNo references here.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := viewNote([]string{"solo"}); err != nil {
+			t.Fatalf("viewNote returned error: %v", err)
+		}
+	})
+
+	if output != "# Solo\n\nNo references here.\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
 func withTempDir(t *testing.T) {
 	t.Helper()
 
