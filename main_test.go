@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -655,6 +656,141 @@ func TestUnarchiveNoteClearsArchivedMetadata(t *testing.T) {
 	}
 	if output != "unarchived daily-log\n" {
 		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestRenameNotePreservesContentAndMetadata(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldPath := notePath("daily-log")
+	want := "# Daily Log\nTags: urgent, work\nArchived: true\n\nBody\n"
+	if err := os.WriteFile(oldPath, []byte(want), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := renameNote([]string{"daily-log", "project-log"}); err != nil {
+			t.Fatalf("renameNote returned error: %v", err)
+		}
+	})
+
+	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected old path to be gone, got err=%v", err)
+	}
+
+	got, err := os.ReadFile(notePath("project-log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+	if output != "renamed daily-log to project-log\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestRenameNoteUpdatesListAndSearchDiscoverability(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\nTags: work\nArchived: true\n\nSearchable body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := renameNote([]string{"daily-log", "project-log"}); err != nil {
+		t.Fatalf("renameNote returned error: %v", err)
+	}
+
+	listOutput := captureStdout(t, func() {
+		if err := listNotes([]string{"--include-archived", "--tag", "work"}); err != nil {
+			t.Fatalf("listNotes returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(listOutput, "project-log") || strings.Contains(listOutput, "daily-log") {
+		t.Fatalf("expected list output to include only renamed id, got %q", listOutput)
+	}
+	if !strings.Contains(listOutput, "Daily Log") || !strings.Contains(listOutput, "work") {
+		t.Fatalf("expected preserved title/tags in list output, got %q", listOutput)
+	}
+
+	searchOutput := captureStdout(t, func() {
+		if err := searchNotes([]string{"searchable", "--include-archived"}); err != nil {
+			t.Fatalf("searchNotes returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(searchOutput, "project-log") || strings.Contains(searchOutput, "daily-log") {
+		t.Fatalf("expected search output to include only renamed id, got %q", searchOutput)
+	}
+	if !strings.Contains(searchOutput, "Daily Log") {
+		t.Fatalf("expected preserved title in search output, got %q", searchOutput)
+	}
+}
+
+func TestRenameNoteRejectsExistingTarget(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("project-log"), []byte("# Project Log\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := renameNote([]string{"daily-log", "project-log"})
+	if err == nil || err.Error() != "note \"project-log\" already exists" {
+		t.Fatalf("expected collision error, got %v", err)
+	}
+}
+
+func TestRenameNoteRejectsInvalidTargetID(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := renameNote([]string{"daily-log", "../escape"})
+	if err == nil || err.Error() != "new id cannot contain path separators" {
+		t.Fatalf("expected invalid id error, got %v", err)
+	}
+}
+
+func TestRunIncludesRenameCommand(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run([]string{"rename", "daily-log", "project-log"}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+
+	if _, err := os.Stat(notePath("project-log")); err != nil {
+		t.Fatalf("expected renamed note to exist, got %v", err)
 	}
 }
 

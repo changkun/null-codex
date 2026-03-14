@@ -66,6 +66,8 @@ func run(args []string) error {
 		return archiveNote(args[1:])
 	case "unarchive":
 		return unarchiveNote(args[1:])
+	case "rename", "mv":
+		return renameNote(args[1:])
 	case "today":
 		return openTodayNote()
 	case "view", "show":
@@ -297,6 +299,40 @@ func deleteNote(args []string) error {
 	}
 
 	fmt.Printf("deleted %s\n", args[0])
+	return nil
+}
+
+func renameNote(args []string) error {
+	if len(args) != 2 {
+		return errors.New("rename requires an old id and new id")
+	}
+
+	oldID := strings.TrimSpace(args[0])
+	newID := strings.TrimSpace(args[1])
+	if err := validateRenameID(newID); err != nil {
+		return err
+	}
+
+	oldPath := notePath(oldID)
+	if _, err := os.Stat(oldPath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("note %q not found", oldID)
+		}
+		return err
+	}
+
+	newPath := notePath(newID)
+	if _, err := os.Stat(newPath); err == nil {
+		return fmt.Errorf("note %q already exists", newID)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return err
+	}
+
+	fmt.Printf("renamed %s to %s\n", oldID, newID)
 	return nil
 }
 
@@ -685,6 +721,19 @@ func formatTags(tags []string) string {
 	return strings.Join(tags, ",")
 }
 
+func validateRenameID(id string) error {
+	if id == "" {
+		return errors.New("new id cannot be empty")
+	}
+	if strings.ContainsAny(id, `/\`) {
+		return errors.New("new id cannot contain path separators")
+	}
+	if id == "." || id == ".." {
+		return errors.New("new id cannot be . or ..")
+	}
+	return nil
+}
+
 func printUsage() {
 	fmt.Println("notes <command> [arguments]")
 	fmt.Println("")
@@ -693,6 +742,7 @@ func printUsage() {
 	fmt.Println("  edit <id> [content] [--tag <tag>] [--tags a,b]       Replace note body/tags or open in $EDITOR")
 	fmt.Println("  archive <id>                Mark a note as archived")
 	fmt.Println("  unarchive <id>              Remove archived status from a note")
+	fmt.Println("  rename <old-id> <new-id>    Rename a note file without changing its content")
 	fmt.Println("  list [--tag <tag>]... [--include-archived|--archived-only]   List saved notes")
 	fmt.Println("  search <query> [--tag <tag>]... [--include-archived|--archived-only] Search note titles and bodies")
 	fmt.Println("  today                     Create or open today's daily note")

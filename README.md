@@ -10,6 +10,7 @@ go run . edit daily-log --tags work,review "Replaced the body from the CLI."
 go run . edit daily-log --clear-tags
 go run . archive daily-log
 go run . unarchive daily-log
+go run . rename daily-log project-log
 EDITOR=vim go run . edit daily-log
 EDITOR=vim go run . today
 go run . list --tag work
@@ -27,6 +28,7 @@ go run . delete daily-log
 - `create` writes a Markdown file with a heading based on the note title and optional normalized tags.
 - `edit` updates an existing note body and tags from the CLI, clears tags with `--clear-tags`, or opens the file in `$EDITOR`.
 - `archive` and `unarchive` toggle a note's archived status by updating note metadata in place.
+- `rename` changes a note's ID by renaming the Markdown file without altering its title, tags, archive status, or body.
 - `list` shows note ID, last modified timestamp, title, and tags, filters with repeated `--tag` flags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `search` performs case-insensitive full-text search across note titles and bodies, can be narrowed to notes matching all requested tags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `today` creates `notes/YYYY-MM-DD.md` when missing and opens today's daily note in `$EDITOR`.

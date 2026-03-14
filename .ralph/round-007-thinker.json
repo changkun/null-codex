@@ -1,0 +1,3 @@
+{
+  "result": "Goal: add a `rename` command that safely changes a note’s ID/filename while preserving its title, tags, archive status, and discoverability in existing workflows."
+}
