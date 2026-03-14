@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -41,6 +42,7 @@ type noteContent struct {
 	Title    string
 	Tags     []string
 	Archived bool
+	BodyLine int
 	Body     string
 }
 
@@ -158,6 +160,11 @@ type webNoteDetail struct {
 	Backlinks         []webLink
 	BrokenLinks       []string
 	OutgoingLinksText string
+}
+
+type taskRenderOptions struct {
+	NoteID    string
+	ReturnURL string
 }
 
 type webNoteForm struct {
@@ -357,6 +364,10 @@ func searchNotes(args []string) error {
 }
 
 func listTasks(args []string) error {
+	if len(args) > 0 && args[0] == "toggle" {
+		return toggleTask(args[1:])
+	}
+
 	opts, err := parseFilterOptions(args)
 	if err != nil {
 		return err
@@ -377,7 +388,7 @@ func listTasks(args []string) error {
 			return err
 		}
 
-		tasks := openTasksFromBody(content.Body)
+		tasks := openTasksFromContent(content)
 		if len(tasks) == 0 {
 			continue
 		}
@@ -406,10 +417,34 @@ func listTasks(args []string) error {
 	for _, group := range groups {
 		fmt.Printf("%s\t%s\t%s\t%s\n", group.ID, group.ModTime, group.Title, formatTags(group.Tags))
 		for _, task := range group.Tasks {
-			fmt.Printf("\t[ ] %s\n", task.Text)
+			fmt.Printf("\t%d\t[ ] %s\n", task.Line, task.Text)
 		}
 	}
 
+	return nil
+}
+
+func toggleTask(args []string) error {
+	if len(args) != 2 {
+		return errors.New("tasks toggle requires a note id and line number")
+	}
+
+	id := strings.TrimSpace(args[0])
+	line, err := strconv.Atoi(strings.TrimSpace(args[1]))
+	if err != nil || line < 1 {
+		return errors.New("task line must be a positive integer")
+	}
+
+	task, err := toggleTaskByLine(id, line)
+	if err != nil {
+		return err
+	}
+
+	state := "open"
+	if !task.Open {
+		state = "done"
+	}
+	fmt.Printf("toggled task %d in %s to %s\n", line, id, state)
 	return nil
 }
 
@@ -713,6 +748,7 @@ func serveNotes(args []string) error {
 func newServeMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveIndexPage)
+	mux.HandleFunc("/tasks/toggle", serveToggleTask)
 	mux.HandleFunc("/tasks", serveTasksPage)
 	mux.HandleFunc("/new", serveCreateNotePage)
 	mux.HandleFunc("/notes", serveCreateNote)
@@ -785,6 +821,36 @@ func serveTasksPage(w http.ResponseWriter, r *http.Request) {
 		TaskGroups:      taskGroups,
 	}
 	renderNotebookPage(w, data)
+}
+
+func serveToggleTask(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	id := strings.TrimSpace(r.FormValue("note"))
+	line, err := strconv.Atoi(strings.TrimSpace(r.FormValue("line")))
+	if err != nil || line < 1 {
+		http.Error(w, "invalid task line", http.StatusBadRequest)
+		return
+	}
+	if _, err := toggleTaskByLine(id, line); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, fs.ErrNotExist) || strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "line") || strings.Contains(err.Error(), "task") {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	http.Redirect(w, r, safeReturnURL(r.FormValue("return_to"), noteURL(id)), http.StatusSeeOther)
 }
 
 func serveCreateNotePage(w http.ResponseWriter, r *http.Request) {
@@ -1359,7 +1425,8 @@ func readNoteContent(path string) (noteContent, error) {
 func parseNoteContent(path, data string) noteContent {
 	lines := strings.Split(data, "\n")
 	content := noteContent{
-		Title: strings.TrimSuffix(filepath.Base(path), ".md"),
+		Title:    strings.TrimSuffix(filepath.Base(path), ".md"),
+		BodyLine: 1,
 	}
 
 	bodyStart := 0
@@ -1399,6 +1466,7 @@ body:
 	for bodyStart < len(lines) && strings.TrimSpace(lines[bodyStart]) == "" {
 		bodyStart++
 	}
+	content.BodyLine = bodyStart + 1
 	content.Body = strings.TrimRight(strings.Join(lines[bodyStart:], "\n"), "\n")
 
 	return content
@@ -1742,7 +1810,7 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 			Tags:              append([]string(nil), note.Tags...),
 			Archived:          note.Archived,
 			ModTime:           note.ModTime.Format(time.RFC3339),
-			RenderedBody:      renderMarkdownHTML(content.Body, existing),
+			RenderedBody:      renderMarkdownHTML(content, existing, &taskRenderOptions{NoteID: note.ID, ReturnURL: noteURL(note.ID)}),
 			OutgoingLinks:     outgoing,
 			Backlinks:         currentBacklinks,
 			BrokenLinks:       broken,
@@ -1752,7 +1820,7 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 		snapshot.Notes = append(snapshot.Notes, summary)
 		snapshot.NotesByID[note.ID] = summary
 		snapshot.RenderedNotes[note.ID] = detail
-		if tasks := openTasksFromBody(content.Body); len(tasks) > 0 {
+		if tasks := openTasksFromContent(content); len(tasks) > 0 {
 			group := webTaskGroup{
 				ID:        note.ID,
 				Title:     note.Title,
@@ -1891,6 +1959,14 @@ func tasksURL(tag string, includeArchived bool) string {
 		return "/tasks?" + encoded
 	}
 	return "/tasks"
+}
+
+func safeReturnURL(raw, fallback string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
+		return fallback
+	}
+	return raw
 }
 
 func notebookSubtitle(count int) string {
@@ -2661,8 +2737,8 @@ func diffOperations(a, b []string) []diffOp {
 	return ops
 }
 
-func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML {
-	lines := strings.Split(body, "\n")
+func renderMarkdownHTML(content noteContent, existing map[string]struct{}, tasks *taskRenderOptions) template.HTML {
+	lines := strings.Split(content.Body, "\n")
 	var b strings.Builder
 	inList := false
 	inCode := false
@@ -2674,7 +2750,8 @@ func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML
 		}
 	}
 
-	for _, raw := range lines {
+	for i, raw := range lines {
+		lineNo := content.BodyLine + i
 		trimmed := strings.TrimSpace(raw)
 		if strings.HasPrefix(trimmed, "```") {
 			closeList()
@@ -2719,7 +2796,7 @@ func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML
 				b.WriteString("<ul>")
 				inList = true
 			}
-			b.WriteString("<li>" + renderListItemMarkdown(strings.TrimSpace(trimmed[2:]), existing) + "</li>")
+			b.WriteString("<li>" + renderListItemMarkdown(strings.TrimSpace(trimmed[2:]), existing, tasks, lineNo) + "</li>")
 			continue
 		}
 
@@ -2734,7 +2811,7 @@ func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML
 	return template.HTML(b.String())
 }
 
-func renderListItemMarkdown(text string, existing map[string]struct{}) string {
+func renderListItemMarkdown(text string, existing map[string]struct{}, tasks *taskRenderOptions, line int) string {
 	task, ok := parseTaskLine(text)
 	if !ok {
 		return renderInlineMarkdown(text, existing)
@@ -2744,7 +2821,17 @@ func renderListItemMarkdown(text string, existing map[string]struct{}) string {
 	if !task.Open {
 		checked = " checked"
 	}
-	return `<label class="task-item"><input type="checkbox" disabled` + checked + `><span>` + renderInlineMarkdown(task.Text, existing) + `</span></label>`
+	body := renderInlineMarkdown(task.Text, existing)
+	if tasks == nil || tasks.NoteID == "" {
+		return `<label class="task-item"><input type="checkbox" disabled` + checked + `><span>` + body + `</span></label>`
+	}
+
+	return `<form class="task-toggle-form" method="post" action="/tasks/toggle">` +
+		`<input type="hidden" name="note" value="` + html.EscapeString(tasks.NoteID) + `">` +
+		`<input type="hidden" name="line" value="` + strconv.Itoa(line) + `">` +
+		`<input type="hidden" name="return_to" value="` + html.EscapeString(tasks.ReturnURL) + `">` +
+		`<label class="task-item task-item-toggle"><input type="checkbox" onchange="this.form.submit()"` + checked + `><span>` + body + `</span></label>` +
+		`</form>`
 }
 
 func renderInlineMarkdown(text string, existing map[string]struct{}) string {
@@ -2772,6 +2859,63 @@ func openTasksFromBody(body string) []noteTask {
 		tasks = append(tasks, task)
 	}
 	return tasks
+}
+
+func openTasksFromContent(content noteContent) []noteTask {
+	tasks := openTasksFromBody(content.Body)
+	for i := range tasks {
+		tasks[i].Line += content.BodyLine - 1
+	}
+	return tasks
+}
+
+func toggleTaskByLine(id string, line int) (noteTask, error) {
+	path := notePath(id)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return noteTask{}, fmt.Errorf("note %q not found", id)
+		}
+		return noteTask{}, err
+	}
+
+	updated, task, err := toggleTaskLine(string(data), line)
+	if err != nil {
+		return noteTask{}, err
+	}
+	if err := writeNoteVersioned(id, "toggle-task", []byte(updated)); err != nil {
+		return noteTask{}, err
+	}
+	return task, nil
+}
+
+func toggleTaskLine(data string, line int) (string, noteTask, error) {
+	lines := strings.Split(data, "\n")
+	if line < 1 || line > len(lines) {
+		return "", noteTask{}, fmt.Errorf("line %d is out of range", line)
+	}
+
+	raw := lines[line-1]
+	trimmed := strings.TrimLeft(raw, " \t")
+	if !(strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ")) {
+		return "", noteTask{}, fmt.Errorf("line %d is not a Markdown task", line)
+	}
+
+	task, ok := parseTaskLine(strings.TrimSpace(trimmed[2:]))
+	if !ok {
+		return "", noteTask{}, fmt.Errorf("line %d is not a Markdown task", line)
+	}
+
+	indent := raw[:len(raw)-len(trimmed)]
+	task.Open = !task.Open
+	state := "[x]"
+	if task.Open {
+		state = "[ ]"
+	}
+
+	lines[line-1] = indent + trimmed[:2] + state + " " + task.Text
+	task.Line = line
+	return strings.Join(lines, "\n"), task, nil
 }
 
 func parseTaskLine(text string) (noteTask, bool) {
@@ -2871,8 +3015,10 @@ func notebookPageTemplate() *template.Template {
     .task-group { border:1px solid var(--line); border-radius:16px; padding:1rem 1rem 0.9rem; background:#fff; }
     .task-group h2 { margin:0 0 0.35rem; font-size:1.1rem; }
     .task-list { display:grid; gap:0.65rem; margin-top:0.85rem; }
+    .task-toggle-form { margin:0; }
     .task-item { display:flex; align-items:flex-start; gap:0.6rem; }
     .task-item input { margin-top:0.2rem; }
+    .task-item-toggle { cursor:pointer; }
     .form-actions { display:flex; gap:0.75rem; flex-wrap:wrap; }
     @media (max-width: 880px) {
       .layout { grid-template-columns: 1fr; }
@@ -3009,8 +3155,14 @@ func notebookPageTemplate() *template.Template {
                     </div>
                   {{end}}
                   <div class="task-list">
+                    {{$group := .}}
                     {{range .Tasks}}
-                      <label class="task-item"><input type="checkbox" disabled><span>{{.Text}}</span></label>
+                      <form class="task-toggle-form" method="post" action="/tasks/toggle">
+                        <input type="hidden" name="note" value="{{$group.ID}}">
+                        <input type="hidden" name="line" value="{{.Line}}">
+                        <input type="hidden" name="return_to" value="{{$.TasksPageURL}}">
+                        <label class="task-item task-item-toggle"><input type="checkbox" onchange="this.form.submit()"><span>{{.Text}}</span></label>
+                      </form>
                     {{end}}
                   </div>
                 </section>
@@ -3225,7 +3377,8 @@ func printUsage() {
 	fmt.Println("  rename <old-id> <new-id>    Rename a note file and rewrite matching note links")
 	fmt.Println("  list [--tag <tag>]... [--include-archived|--archived-only]   List saved notes")
 	fmt.Println("  search <query> [--tag <tag>]... [--include-archived|--archived-only] Search note titles and bodies")
-	fmt.Println("  tasks [--tag <tag>]... [--include-archived|--archived-only]  List open Markdown checkbox tasks")
+	fmt.Println("  tasks [--tag <tag>]... [--include-archived|--archived-only]  List open Markdown checkbox tasks with line numbers")
+	fmt.Println("  tasks toggle <id> <line>   Toggle a Markdown checkbox task by file line")
 	fmt.Println("  today                     Create or open today's daily note")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  links <id>                List outgoing [[note-id]] links from a note")

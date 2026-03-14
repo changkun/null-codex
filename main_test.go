@@ -973,13 +973,13 @@ func TestListTasksGroupsOpenCheckboxesByNote(t *testing.T) {
 	if !strings.Contains(lines[0], "review") || !strings.Contains(lines[0], "Review") {
 		t.Fatalf("expected newest matching note first, got %q", lines[0])
 	}
-	if lines[1] != "\t[ ] Write recap" {
+	if lines[1] != "\t1\t[ ] Write recap" {
 		t.Fatalf("unexpected task line: %q", lines[1])
 	}
 	if !strings.Contains(lines[2], "project") || !strings.Contains(lines[2], "Project") {
 		t.Fatalf("expected second task group, got %q", lines[2])
 	}
-	if lines[3] != "\t[ ] Ship release" {
+	if lines[3] != "\t2\t[ ] Ship release" {
 		t.Fatalf("unexpected open task line: %q", lines[3])
 	}
 	if strings.Contains(output, "Closed item") {
@@ -1056,6 +1056,54 @@ func TestRunIncludesTasksCommand(t *testing.T) {
 
 	if !strings.Contains(output, "daily-log") || !strings.Contains(output, "Follow up") {
 		t.Fatalf("expected tasks output, got %q", output)
+	}
+}
+
+func TestToggleTaskUpdatesCheckboxByFileLine(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("project"), []byte("# Project\nTags: work\n\n- [ ] Ship release\n- [x] Write recap\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listTasks([]string{"toggle", "project", "4"}); err != nil {
+			t.Fatalf("listTasks returned error: %v", err)
+		}
+	})
+
+	if output != "toggled task 4 in project to done\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+
+	got, err := os.ReadFile(notePath("project"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# Project\nTags: work\n\n- [x] Ship release\n- [x] Write recap\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+}
+
+func TestToggleTaskRejectsMissingTaskLine(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("project"), []byte("# Project\n\nPlain text\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := listTasks([]string{"toggle", "project", "3"})
+	if err == nil || err.Error() != "line 3 is not a Markdown task" {
+		t.Fatalf("expected task-line error, got %v", err)
 	}
 }
 
@@ -1707,7 +1755,7 @@ func TestRenderMarkdownHTMLLinksExistingAndBrokenNotes(t *testing.T) {
 		"target": {},
 	}
 
-	got := string(renderMarkdownHTML("See [[target]] and [[missing]].", existing))
+	got := string(renderMarkdownHTML(noteContent{Body: "See [[target]] and [[missing]].", BodyLine: 1}, existing, nil))
 
 	if !strings.Contains(got, `<a class="wiki-link" href="/notes/target">[[target]]</a>`) {
 		t.Fatalf("expected existing wiki link to render as anchor, got %q", got)
@@ -1718,13 +1766,31 @@ func TestRenderMarkdownHTMLLinksExistingAndBrokenNotes(t *testing.T) {
 }
 
 func TestRenderMarkdownHTMLRendersCheckboxItems(t *testing.T) {
-	got := string(renderMarkdownHTML("- [ ] Open\n- [x] Done", nil))
+	got := string(renderMarkdownHTML(noteContent{Body: "- [ ] Open\n- [x] Done", BodyLine: 1}, nil, nil))
 
 	if !strings.Contains(got, `<label class="task-item"><input type="checkbox" disabled><span>Open</span></label>`) {
 		t.Fatalf("expected open checkbox item, got %q", got)
 	}
 	if !strings.Contains(got, `<label class="task-item"><input type="checkbox" disabled checked><span>Done</span></label>`) {
 		t.Fatalf("expected closed checkbox item, got %q", got)
+	}
+}
+
+func TestRenderMarkdownHTMLRendersToggleFormsWhenTaskContextPresent(t *testing.T) {
+	got := string(renderMarkdownHTML(
+		noteContent{Body: "- [ ] Open", BodyLine: 4},
+		nil,
+		&taskRenderOptions{NoteID: "project", ReturnURL: "/notes/project"},
+	))
+
+	if !strings.Contains(got, `action="/tasks/toggle"`) {
+		t.Fatalf("expected task toggle form, got %q", got)
+	}
+	if !strings.Contains(got, `name="line" value="4"`) {
+		t.Fatalf("expected file line in form, got %q", got)
+	}
+	if strings.Contains(got, `disabled`) {
+		t.Fatalf("expected interactive checkbox, got %q", got)
 	}
 }
 
@@ -1942,7 +2008,7 @@ func TestServeIndexPageRendersTagFilterAndWarnings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\n\nSee [[beta]] and [[missing]].\n"), 0o644); err != nil {
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\n\n- [ ] Follow up\nSee [[beta]] and [[missing]].\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(notePath("beta"), []byte("# Beta\nTags: home\n\nBack to [[alpha]].\n"), 0o644); err != nil {
@@ -1980,7 +2046,7 @@ func TestServeNotePageRendersBacklinksAndBrokenWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\n\nSee [[beta]] and [[missing]].\n"), 0o644); err != nil {
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\n\n- [ ] Follow up\nSee [[beta]] and [[missing]].\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(notePath("beta"), []byte("# Beta\n\nBack to [[alpha]].\n"), 0o644); err != nil {
@@ -2011,6 +2077,9 @@ func TestServeNotePageRendersBacklinksAndBrokenWarning(t *testing.T) {
 	}
 	if !strings.Contains(body, `href="/notes/beta">beta</a>`) || !strings.Contains(body, "Backlinks") {
 		t.Fatalf("expected backlinks section, got %q", body)
+	}
+	if !strings.Contains(body, `action="/tasks/toggle"`) {
+		t.Fatalf("expected interactive task toggle form on note page, got %q", body)
 	}
 }
 
@@ -2078,6 +2147,9 @@ func TestServeTasksPageRendersGroupedOpenTasks(t *testing.T) {
 	if !strings.Contains(body, "Alpha task") {
 		t.Fatalf("expected open task in body, got %q", body)
 	}
+	if !strings.Contains(body, `action="/tasks/toggle"`) || !strings.Contains(body, `name="line" value="3"`) {
+		t.Fatalf("expected task toggle form in body, got %q", body)
+	}
 	if strings.Contains(body, "Closed") {
 		t.Fatalf("expected completed task to be hidden, got %q", body)
 	}
@@ -2086,6 +2158,45 @@ func TestServeTasksPageRendersGroupedOpenTasks(t *testing.T) {
 	}
 	if !strings.Contains(body, `href="/tasks?tag=work"`) {
 		t.Fatalf("expected task-page filter links to stay on /tasks, got %q", body)
+	}
+}
+
+func TestServeToggleTaskPostUpdatesNoteAndRedirects(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\n\n- [ ] Alpha task\n- [x] Closed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	form := url.Values{
+		"note":      {"alpha"},
+		"line":      {"3"},
+		"return_to": {"/tasks?tag=work"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/tasks/toggle", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get("Location"); location != "/tasks?tag=work" {
+		t.Fatalf("unexpected redirect target: %q", location)
+	}
+
+	got, err := os.ReadFile(notePath("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# Alpha\n\n- [x] Alpha task\n- [x] Closed\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
 	}
 }
 
