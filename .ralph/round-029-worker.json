@@ -1,0 +1,3 @@
+{
+  "result": "Added a GitHub Actions workflow at [.github/workflows/ci.yml](/home/changkun/null-codex/.github/workflows/ci.yml) that runs on every `push` and `pull_request`, checks out the repo, installs Go from `go.mod`, enables Go module caching, and executes `go test ./...`.\n\nI could not run the test suite locally in this environment because the `go` binary is not installed here. Once this is pushed, GitHub Actions will provide the actual CI verification."
+}
