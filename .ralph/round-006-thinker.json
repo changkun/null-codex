@@ -1,0 +1,3 @@
+{
+  "result": "Implement note archiving, with commands to archive/unarchive notes and filters so `list` and `search` can hide archived notes by default while still allowing them to be included explicitly."
+}

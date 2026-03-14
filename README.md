@@ -8,10 +8,15 @@ A minimal terminal-based note-taking app in Go. Notes are stored as local Markdo
 go run . create "Daily Log" --tag work --tag shipped "Shipped the first version."
 go run . edit daily-log --tags work,review "Replaced the body from the CLI."
 go run . edit daily-log --clear-tags
+go run . archive daily-log
+go run . unarchive daily-log
 EDITOR=vim go run . edit daily-log
 EDITOR=vim go run . today
 go run . list --tag work
+go run . list --include-archived
+go run . list --archived-only
 go run . search shipped --tag work
+go run . search shipped --include-archived
 go run . search --tag review
 go run . view daily-log
 go run . delete daily-log
@@ -21,19 +26,21 @@ go run . delete daily-log
 
 - `create` writes a Markdown file with a heading based on the note title and optional normalized tags.
 - `edit` updates an existing note body and tags from the CLI, clears tags with `--clear-tags`, or opens the file in `$EDITOR`.
-- `list` shows note ID, last modified timestamp, title, and tags, and can be filtered with repeated `--tag` flags.
-- `search` performs case-insensitive full-text search across note titles and bodies and can be narrowed to notes matching all requested tags.
+- `archive` and `unarchive` toggle a note's archived status by updating note metadata in place.
+- `list` shows note ID, last modified timestamp, title, and tags, filters with repeated `--tag` flags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
+- `search` performs case-insensitive full-text search across note titles and bodies, can be narrowed to notes matching all requested tags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `today` creates `notes/YYYY-MM-DD.md` when missing and opens today's daily note in `$EDITOR`.
 - `view` prints the raw Markdown note content.
 - `delete` removes the note file from `notes/`.
 
 ## Note Format
 
-Tagged notes are stored as Markdown with a `Tags:` metadata line under the title:
+Tagged and archived notes are stored as Markdown with metadata lines under the title:
 
 ```md
 # Daily Log
 Tags: shipped, work
+Archived: true
 
 Shipped the first version.
 ```

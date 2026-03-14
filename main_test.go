@@ -138,6 +138,15 @@ func TestEditNoteRequiresEditorWhenNoBodyProvided(t *testing.T) {
 	}
 }
 
+func TestCreateNoteRejectsArchiveFilterFlags(t *testing.T) {
+	withTempDir(t)
+
+	err := createNote([]string{"Daily Log", "--include-archived"})
+	if err == nil || err.Error() != "--include-archived and --archived-only are only valid for list/search" {
+		t.Fatalf("expected filter flag error, got %v", err)
+	}
+}
+
 func TestRunIncludesEditCommand(t *testing.T) {
 	withTempDir(t)
 
@@ -191,6 +200,90 @@ func TestListNotesFiltersByTag(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "project-ideas") || !strings.Contains(lines[0], "work,writing") {
 		t.Fatalf("unexpected list output: %q", lines[0])
+	}
+}
+
+func TestListNotesHidesArchivedByDefault(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("active-note"), []byte("# Active Note\n\nStill current.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("old-note"), []byte("# Old Note\nArchived: true\n\nNo longer active.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listNotes(nil); err != nil {
+			t.Fatalf("listNotes returned error: %v", err)
+		}
+	})
+
+	if strings.Contains(output, "old-note") {
+		t.Fatalf("expected archived note to be hidden, got %q", output)
+	}
+	if !strings.Contains(output, "active-note") {
+		t.Fatalf("expected active note in output, got %q", output)
+	}
+}
+
+func TestListNotesCanIncludeArchived(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("active-note"), []byte("# Active Note\n\nStill current.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("old-note"), []byte("# Old Note\nArchived: true\n\nNo longer active.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listNotes([]string{"--include-archived"}); err != nil {
+			t.Fatalf("listNotes returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "active-note") || !strings.Contains(output, "old-note") {
+		t.Fatalf("expected both notes in output, got %q", output)
+	}
+}
+
+func TestListNotesCanShowOnlyArchived(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("active-note"), []byte("# Active Note\n\nStill current.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("old-note"), []byte("# Old Note\nArchived: true\n\nNo longer active.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listNotes([]string{"--archived-only"}); err != nil {
+			t.Fatalf("listNotes returned error: %v", err)
+		}
+	})
+
+	if strings.Contains(output, "active-note") {
+		t.Fatalf("expected active note to be excluded, got %q", output)
+	}
+	if !strings.Contains(output, "old-note") {
+		t.Fatalf("expected archived note in output, got %q", output)
 	}
 }
 
@@ -298,6 +391,90 @@ func TestSearchNotesAppliesTagFilterAlongsideQuery(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "project-ideas") {
 		t.Fatalf("unexpected search output: %q", lines[0])
+	}
+}
+
+func TestSearchNotesHidesArchivedByDefault(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("active-note"), []byte("# Active Note\n\nSearch is live.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("old-note"), []byte("# Old Note\nArchived: true\n\nSearch is retired.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := searchNotes([]string{"search"}); err != nil {
+			t.Fatalf("searchNotes returned error: %v", err)
+		}
+	})
+
+	if strings.Contains(output, "old-note") {
+		t.Fatalf("expected archived note to be hidden, got %q", output)
+	}
+	if !strings.Contains(output, "active-note") {
+		t.Fatalf("expected active note in output, got %q", output)
+	}
+}
+
+func TestSearchNotesCanIncludeArchived(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("active-note"), []byte("# Active Note\n\nSearch is live.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("old-note"), []byte("# Old Note\nArchived: true\n\nSearch is retired.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := searchNotes([]string{"search", "--include-archived"}); err != nil {
+			t.Fatalf("searchNotes returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "active-note") || !strings.Contains(output, "old-note") {
+		t.Fatalf("expected both notes in output, got %q", output)
+	}
+}
+
+func TestSearchNotesCanShowOnlyArchived(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("active-note"), []byte("# Active Note\n\nSearch is live.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("old-note"), []byte("# Old Note\nArchived: true\n\nSearch is retired.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := searchNotes([]string{"search", "--archived-only"}); err != nil {
+			t.Fatalf("searchNotes returned error: %v", err)
+		}
+	})
+
+	if strings.Contains(output, "active-note") {
+		t.Fatalf("expected active note to be excluded, got %q", output)
+	}
+	if !strings.Contains(output, "old-note") {
+		t.Fatalf("expected archived note in output, got %q", output)
 	}
 }
 
@@ -416,6 +593,103 @@ func TestRunIncludesTodayCommand(t *testing.T) {
 
 	if string(gotArg) != notePath("2026-03-14") {
 		t.Fatalf("expected editor to receive today's note path, got %q", string(gotArg))
+	}
+}
+
+func TestArchiveNoteMarksNoteArchived(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	path := notePath("daily-log")
+	if err := os.WriteFile(path, []byte("# Daily Log\nTags: work\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := archiveNote([]string{"daily-log"}); err != nil {
+			t.Fatalf("archiveNote returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != "# Daily Log\nTags: work\nArchived: true\n\nBody\n" {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+	if output != "archived daily-log\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestUnarchiveNoteClearsArchivedMetadata(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	path := notePath("daily-log")
+	if err := os.WriteFile(path, []byte("# Daily Log\nTags: work\nArchived: true\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := unarchiveNote([]string{"daily-log"}); err != nil {
+			t.Fatalf("unarchiveNote returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != "# Daily Log\nTags: work\n\nBody\n" {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+	if output != "unarchived daily-log\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestRunIncludesArchiveCommands(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	path := notePath("daily-log")
+	if err := os.WriteFile(path, []byte("# Daily Log\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run([]string{"archive", "daily-log"}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Archived: true\n") {
+		t.Fatalf("expected archived metadata, got %q", string(got))
+	}
+
+	if err := run([]string{"unarchive", "daily-log"}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "Archived: true\n") {
+		t.Fatalf("expected archived metadata to be removed, got %q", string(got))
 	}
 }
 

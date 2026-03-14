@@ -18,22 +18,26 @@ const notesDir = "notes"
 var now = time.Now
 
 type noteMeta struct {
-	ID      string
-	Title   string
-	Tags    []string
-	ModTime time.Time
+	ID       string
+	Title    string
+	Tags     []string
+	Archived bool
+	ModTime  time.Time
 }
 
 type noteContent struct {
-	Title string
-	Tags  []string
-	Body  string
+	Title    string
+	Tags     []string
+	Archived bool
+	Body     string
 }
 
 type noteOptions struct {
-	Tags      []string
-	ClearTags bool
-	Body      string
+	Tags            []string
+	ClearTags       bool
+	IncludeArchived bool
+	ArchivedOnly    bool
+	Body            string
 }
 
 func main() {
@@ -58,6 +62,10 @@ func run(args []string) error {
 		return listNotes(args[1:])
 	case "search":
 		return searchNotes(args[1:])
+	case "archive":
+		return archiveNote(args[1:])
+	case "unarchive":
+		return unarchiveNote(args[1:])
 	case "today":
 		return openTodayNote()
 	case "view", "show":
@@ -84,6 +92,9 @@ func createNote(args []string) error {
 
 	opts, err := parseNoteOptions(args[1:])
 	if err != nil {
+		return err
+	}
+	if err := validateMutationOptions(opts); err != nil {
 		return err
 	}
 
@@ -123,6 +134,7 @@ func listNotes(args []string) error {
 	}
 
 	notes = filterNotesByTags(notes, opts.Tags)
+	notes = filterArchivedNotes(notes, opts)
 	if len(notes) == 0 {
 		fmt.Println("no notes found")
 		return nil
@@ -147,6 +159,7 @@ func searchNotes(args []string) error {
 	}
 
 	notes = filterNotesByTags(notes, opts.Tags)
+	notes = filterArchivedNotes(notes, opts)
 	query := strings.ToLower(opts.Body)
 	var matches []noteMeta
 	for _, note := range notes {
@@ -227,6 +240,9 @@ func editNote(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateMutationOptions(opts); err != nil {
+		return err
+	}
 
 	if opts.Body == "" && len(opts.Tags) == 0 && !opts.ClearTags {
 		return openInEditor(path)
@@ -281,6 +297,45 @@ func deleteNote(args []string) error {
 	}
 
 	fmt.Printf("deleted %s\n", args[0])
+	return nil
+}
+
+func archiveNote(args []string) error {
+	return setArchived(args, true)
+}
+
+func unarchiveNote(args []string) error {
+	return setArchived(args, false)
+}
+
+func setArchived(args []string, archived bool) error {
+	if len(args) != 1 {
+		if archived {
+			return errors.New("archive requires a note id")
+		}
+		return errors.New("unarchive requires a note id")
+	}
+
+	id := args[0]
+	path := notePath(id)
+	content, err := readNoteContent(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("note %q not found", id)
+		}
+		return err
+	}
+
+	content.Archived = archived
+	if err := os.WriteFile(path, []byte(formatNote(content)), 0o644); err != nil {
+		return err
+	}
+
+	if archived {
+		fmt.Printf("archived %s\n", id)
+	} else {
+		fmt.Printf("unarchived %s\n", id)
+	}
 	return nil
 }
 
@@ -362,13 +417,23 @@ func parseNoteContent(path, data string) noteContent {
 	}
 
 	if bodyStart < len(lines) {
-		line := strings.TrimSpace(lines[bodyStart])
-		if strings.HasPrefix(strings.ToLower(line), "tags:") {
-			content.Tags = normalizeTags(strings.Split(strings.TrimSpace(line[5:]), ","))
-			bodyStart++
+		for bodyStart < len(lines) {
+			line := strings.TrimSpace(lines[bodyStart])
+			lower := strings.ToLower(line)
+			switch {
+			case strings.HasPrefix(lower, "tags:"):
+				content.Tags = normalizeTags(strings.Split(strings.TrimSpace(line[5:]), ","))
+				bodyStart++
+			case strings.HasPrefix(lower, "archived:"):
+				content.Archived = strings.EqualFold(strings.TrimSpace(line[9:]), "true")
+				bodyStart++
+			default:
+				goto body
+			}
 		}
 	}
 
+body:
 	for bodyStart < len(lines) && strings.TrimSpace(lines[bodyStart]) == "" {
 		bodyStart++
 	}
@@ -404,10 +469,11 @@ func loadNotes() ([]noteMeta, error) {
 		}
 
 		notes = append(notes, noteMeta{
-			ID:      id,
-			Title:   content.Title,
-			Tags:    content.Tags,
-			ModTime: info.ModTime(),
+			ID:       id,
+			Title:    content.Title,
+			Tags:     content.Tags,
+			Archived: content.Archived,
+			ModTime:  info.ModTime(),
 		})
 	}
 
@@ -427,6 +493,9 @@ func formatNote(note noteContent) string {
 	fmt.Fprintf(&b, "# %s\n", note.Title)
 	if len(note.Tags) > 0 {
 		fmt.Fprintf(&b, "Tags: %s\n", strings.Join(note.Tags, ", "))
+	}
+	if note.Archived {
+		b.WriteString("Archived: true\n")
 	}
 	b.WriteString("\n")
 	if note.Body != "" {
@@ -483,6 +552,10 @@ func parseNoteOptions(args []string) (noteOptions, error) {
 		switch {
 		case arg == "--clear-tags":
 			opts.ClearTags = true
+		case arg == "--include-archived":
+			opts.IncludeArchived = true
+		case arg == "--archived-only":
+			opts.ArchivedOnly = true
 		case arg == "--tag":
 			if i+1 >= len(args) {
 				return noteOptions{}, errors.New("--tag requires a value")
@@ -520,7 +593,17 @@ func parseFilterOptions(args []string) (noteOptions, error) {
 	if opts.ClearTags {
 		return noteOptions{}, errors.New("--clear-tags is only valid for create/edit")
 	}
+	if opts.ArchivedOnly {
+		opts.IncludeArchived = true
+	}
 	return opts, nil
+}
+
+func validateMutationOptions(opts noteOptions) error {
+	if opts.IncludeArchived || opts.ArchivedOnly {
+		return errors.New("--include-archived and --archived-only are only valid for list/search")
+	}
+	return nil
 }
 
 func parseSearchOptions(args []string) (noteOptions, error) {
@@ -530,6 +613,9 @@ func parseSearchOptions(args []string) (noteOptions, error) {
 	}
 	if opts.ClearTags {
 		return noteOptions{}, errors.New("--clear-tags is only valid for create/edit")
+	}
+	if opts.ArchivedOnly {
+		opts.IncludeArchived = true
 	}
 	if opts.Body == "" && len(opts.Tags) == 0 {
 		return noteOptions{}, errors.New("search requires a query or at least one --tag")
@@ -545,6 +631,30 @@ func filterNotesByTags(notes []noteMeta, tags []string) []noteMeta {
 	var filtered []noteMeta
 	for _, note := range notes {
 		if hasAllTags(note.Tags, tags) {
+			filtered = append(filtered, note)
+		}
+	}
+	return filtered
+}
+
+func filterArchivedNotes(notes []noteMeta, opts noteOptions) []noteMeta {
+	if opts.ArchivedOnly {
+		var filtered []noteMeta
+		for _, note := range notes {
+			if note.Archived {
+				filtered = append(filtered, note)
+			}
+		}
+		return filtered
+	}
+
+	if opts.IncludeArchived {
+		return notes
+	}
+
+	var filtered []noteMeta
+	for _, note := range notes {
+		if !note.Archived {
 			filtered = append(filtered, note)
 		}
 	}
@@ -581,8 +691,10 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  create <title> [content] [--tag <tag>] [--tags a,b]  Create a Markdown note")
 	fmt.Println("  edit <id> [content] [--tag <tag>] [--tags a,b]       Replace note body/tags or open in $EDITOR")
-	fmt.Println("  list [--tag <tag>]...                                 List saved notes")
-	fmt.Println("  search <query> [--tag <tag>]...                       Search note titles and bodies")
+	fmt.Println("  archive <id>                Mark a note as archived")
+	fmt.Println("  unarchive <id>              Remove archived status from a note")
+	fmt.Println("  list [--tag <tag>]... [--include-archived|--archived-only]   List saved notes")
+	fmt.Println("  search <query> [--tag <tag>]... [--include-archived|--archived-only] Search note titles and bodies")
 	fmt.Println("  today                     Create or open today's daily note")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  delete <id>               Delete a note")

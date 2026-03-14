@@ -1,0 +1,3 @@
+{
+  "result": "Implemented note archiving in [main.go](/home/changkun/null-codex/main.go). Notes now support an `Archived: true` metadata line, `archive` and `unarchive` commands toggle that state, and both `list` and `search` exclude archived notes by default. `list`/`search` also now accept `--include-archived` and `--archived-only`, while `create`/`edit` reject those filter flags.\n\nI added regression coverage in [main_test.go](/home/changkun/null-codex/main_test.go) for archive toggling and the new default/include/only filtering behavior, and updated the CLI docs in [README.md](/home/changkun/null-codex/README.md).\n\nI could not run `gofmt` or `go test` because this environment does not have `go` or `gofmt` installed on `PATH`."
+}
