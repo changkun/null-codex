@@ -1,0 +1,3 @@
+{
+  "result": "Add full-text search to the web UI, including tag and archived filters, so browser use reaches parity with the existing CLI `search` command."
+}

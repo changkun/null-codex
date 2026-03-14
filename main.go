@@ -111,9 +111,12 @@ type notebookPageData struct {
 	Title           string
 	HeaderTitle     string
 	HeaderSubtitle  string
-	ActiveTag       string
-	AvailableTags   []string
-	IncludeArchived bool
+	SearchQuery     string
+	FilterTagsInput string
+	ActiveTags      []string
+	TagFilters      []webTagFilter
+	ArchivedMode    string
+	ClearTagsURL    string
 	FilterPage      string
 	ShowTasks       bool
 	TasksPageURL    string
@@ -128,6 +131,8 @@ type webNoteSummary struct {
 	ID           string
 	Title        string
 	Tags         []string
+	Body         string
+	Snippet      string
 	Archived     bool
 	ModTime      string
 	LinksCount   int
@@ -209,6 +214,19 @@ type webLink struct {
 	ID    string
 	Title string
 	URL   string
+}
+
+type webTagFilter struct {
+	Name   string
+	URL    string
+	Active bool
+}
+
+type webFilterOptions struct {
+	Query        string
+	Tags         []string
+	TagsInput    string
+	ArchivedMode string
 }
 
 type notebookSnapshot struct {
@@ -795,19 +813,24 @@ func serveIndexPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	filter := parseWebFilterOptions(r.URL.Query())
+	notes := filterSnapshotNotes(snapshot.Notes, filter)
 
 	data := notebookPageData{
 		Title:           "Notebook",
 		HeaderTitle:     "Notebook",
-		HeaderSubtitle:  notebookSubtitle(len(snapshot.Notes)),
-		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
-		AvailableTags:   snapshot.Tags,
-		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		HeaderSubtitle:  notebookSubtitle(len(notes)),
+		SearchQuery:     filter.Query,
+		FilterTagsInput: filter.TagsInput,
+		ActiveTags:      append([]string(nil), filter.Tags...),
+		TagFilters:      buildTagFilters("/", snapshot.Tags, filter),
+		ArchivedMode:    filter.ArchivedMode,
+		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
-		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		TasksPageURL:    tasksURL(filter),
 	}
 
-	data.Notes = filterSnapshotNotes(snapshot.Notes, data.ActiveTag, data.IncludeArchived)
+	data.Notes = notes
 	renderNotebookPage(w, data)
 }
 
@@ -827,9 +850,8 @@ func serveTasksPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activeTag := strings.TrimSpace(r.URL.Query().Get("tag"))
-	includeArchived := queryIncludesArchived(r.URL.Query())
-	taskGroups := filterTaskGroups(snapshot.TaskGroups, activeTag, includeArchived)
+	filter := parseWebFilterOptions(r.URL.Query())
+	taskGroups := filterTaskGroups(snapshot.TaskGroups, filter)
 	taskCount := 0
 	for _, group := range taskGroups {
 		taskCount += len(group.Tasks)
@@ -839,13 +861,16 @@ func serveTasksPage(w http.ResponseWriter, r *http.Request) {
 		Title:           "Open Tasks",
 		HeaderTitle:     "Open Tasks",
 		HeaderSubtitle:  fmt.Sprintf("%d open %s", taskCount, pluralize(taskCount, "task", "tasks")),
-		ActiveTag:       activeTag,
-		AvailableTags:   snapshot.Tags,
-		IncludeArchived: includeArchived,
+		SearchQuery:     filter.Query,
+		FilterTagsInput: filter.TagsInput,
+		ActiveTags:      append([]string(nil), filter.Tags...),
+		TagFilters:      buildTagFilters("/tasks", snapshot.Tags, filter),
+		ArchivedMode:    filter.ArchivedMode,
+		ClearTagsURL:    clearTagFiltersURL("/tasks", filter),
 		FilterPage:      "/tasks",
 		ShowTasks:       true,
-		TasksPageURL:    tasksURL(activeTag, includeArchived),
-		Notes:           filterSnapshotNotes(snapshot.Notes, activeTag, includeArchived),
+		TasksPageURL:    tasksURL(filter),
+		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		TaskGroups:      taskGroups,
 	}
 	renderNotebookPage(w, data)
@@ -896,17 +921,21 @@ func serveCreateNotePage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	filter := parseWebFilterOptions(r.URL.Query())
 
 	data := notebookPageData{
 		Title:           "New Note",
 		HeaderTitle:     "New Note",
 		HeaderSubtitle:  "Create a notebook entry in the browser",
-		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
-		AvailableTags:   snapshot.Tags,
-		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		SearchQuery:     filter.Query,
+		FilterTagsInput: filter.TagsInput,
+		ActiveTags:      append([]string(nil), filter.Tags...),
+		TagFilters:      buildTagFilters("/", snapshot.Tags, filter),
+		ArchivedMode:    filter.ArchivedMode,
+		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
-		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
-		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		TasksPageURL:    tasksURL(filter),
+		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		NoteForm: &webNoteForm{
 			ActionURL:   "/notes",
 			CancelURL:   "/",
@@ -1022,17 +1051,21 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	filter := parseWebFilterOptions(r.URL.Query())
 
 	data := notebookPageData{
 		Title:           detail.Title,
 		HeaderTitle:     detail.Title,
 		HeaderSubtitle:  id,
-		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
-		AvailableTags:   snapshot.Tags,
-		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		SearchQuery:     filter.Query,
+		FilterTagsInput: filter.TagsInput,
+		ActiveTags:      append([]string(nil), filter.Tags...),
+		TagFilters:      buildTagFilters("/", snapshot.Tags, filter),
+		ArchivedMode:    filter.ArchivedMode,
+		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
-		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
-		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		TasksPageURL:    tasksURL(filter),
+		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		CurrentNote:     &detail,
 	}
 	renderNotebookPage(w, data)
@@ -1075,17 +1108,21 @@ func serveNoteHistoryPage(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	history.NoteTitle = detail.Title
+	filter := parseWebFilterOptions(r.URL.Query())
 
 	data := notebookPageData{
 		Title:           "History for " + detail.Title,
 		HeaderTitle:     "Note History",
 		HeaderSubtitle:  id,
-		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
-		AvailableTags:   snapshot.Tags,
-		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		SearchQuery:     filter.Query,
+		FilterTagsInput: filter.TagsInput,
+		ActiveTags:      append([]string(nil), filter.Tags...),
+		TagFilters:      buildTagFilters("/", snapshot.Tags, filter),
+		ArchivedMode:    filter.ArchivedMode,
+		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
-		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
-		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		TasksPageURL:    tasksURL(filter),
+		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		CurrentNote:     &detail,
 		NoteHistory:     history,
 	}
@@ -1110,17 +1147,21 @@ func serveEditNotePage(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	filter := parseWebFilterOptions(r.URL.Query())
 
 	data := notebookPageData{
 		Title:           "Edit " + detail.Title,
 		HeaderTitle:     "Edit Note",
 		HeaderSubtitle:  id,
-		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
-		AvailableTags:   snapshot.Tags,
-		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		SearchQuery:     filter.Query,
+		FilterTagsInput: filter.TagsInput,
+		ActiveTags:      append([]string(nil), filter.Tags...),
+		TagFilters:      buildTagFilters("/", snapshot.Tags, filter),
+		ArchivedMode:    filter.ArchivedMode,
+		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
-		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
-		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		TasksPageURL:    tasksURL(filter),
+		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		NoteForm: &webNoteForm{
 			Title:       content.Title,
 			Tags:        strings.Join(content.Tags, ", "),
@@ -1193,16 +1234,20 @@ func renderWebFormError(w http.ResponseWriter, r *http.Request, status int, head
 	}
 
 	form.Error = err.Error()
+	filter := parseWebFilterOptions(r.URL.Query())
 	data := notebookPageData{
 		Title:           headerTitle,
 		HeaderTitle:     headerTitle,
 		HeaderSubtitle:  headerSubtitle,
-		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
-		AvailableTags:   snapshot.Tags,
-		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		SearchQuery:     filter.Query,
+		FilterTagsInput: filter.TagsInput,
+		ActiveTags:      append([]string(nil), filter.Tags...),
+		TagFilters:      buildTagFilters("/", snapshot.Tags, filter),
+		ArchivedMode:    filter.ArchivedMode,
+		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
-		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
-		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		TasksPageURL:    tasksURL(filter),
+		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		NoteForm:        &form,
 	}
 	renderNotebookPageStatus(w, status, data)
@@ -2004,6 +2049,7 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 			ID:          note.ID,
 			Title:       note.Title,
 			Tags:        append([]string(nil), note.Tags...),
+			Body:        content.Body,
 			Archived:    note.Archived,
 			ModTime:     note.ModTime.Format(time.RFC3339),
 			LinksCount:  len(outgoing),
@@ -2097,27 +2143,57 @@ func findNoteMeta(notes []noteMeta, id string) noteMeta {
 	return noteMeta{}
 }
 
-func filterSnapshotNotes(notes []webNoteSummary, tag string, includeArchived bool) []webNoteSummary {
+func parseWebFilterOptions(values url.Values) webFilterOptions {
+	filter := webFilterOptions{
+		Query:        strings.TrimSpace(values.Get("q")),
+		ArchivedMode: queryArchivedMode(values),
+	}
+	filter.Tags = parseWebTags(values.Get("tags"))
+	for _, tag := range values["tag"] {
+		filter.Tags = normalizeTags(append(filter.Tags, tag))
+	}
+	filter.TagsInput = strings.Join(filter.Tags, ", ")
+	return filter
+}
+
+func filterSnapshotNotes(notes []webNoteSummary, filter webFilterOptions) []webNoteSummary {
 	var filtered []webNoteSummary
+	query := strings.ToLower(filter.Query)
 	for _, note := range notes {
-		if tag != "" && !hasAllTags(note.Tags, []string{tag}) {
+		if !hasAllTags(note.Tags, filter.Tags) {
 			continue
 		}
-		if !includeArchived && note.Archived {
+		if filter.ArchivedMode == "exclude" && note.Archived {
 			continue
 		}
-		filtered = append(filtered, note)
+		if filter.ArchivedMode == "only" && !note.Archived {
+			continue
+		}
+		if query != "" {
+			searchText := strings.ToLower(note.Title + "\n" + note.Body)
+			if !strings.Contains(searchText, query) {
+				continue
+			}
+		}
+
+		current := note
+		current.Snippet = buildSearchSnippet(note.Body, query)
+		current.DetailURL = noteFilterURL(note.ID, filter)
+		filtered = append(filtered, current)
 	}
 	return filtered
 }
 
-func filterTaskGroups(groups []webTaskGroup, tag string, includeArchived bool) []webTaskGroup {
+func filterTaskGroups(groups []webTaskGroup, filter webFilterOptions) []webTaskGroup {
 	var filtered []webTaskGroup
 	for _, group := range groups {
-		if tag != "" && !hasAllTags(group.Tags, []string{tag}) {
+		if !hasAllTags(group.Tags, filter.Tags) {
 			continue
 		}
-		if !includeArchived && group.Archived {
+		if filter.ArchivedMode == "exclude" && group.Archived {
+			continue
+		}
+		if filter.ArchivedMode == "only" && !group.Archived {
 			continue
 		}
 		filtered = append(filtered, group)
@@ -2125,9 +2201,16 @@ func filterTaskGroups(groups []webTaskGroup, tag string, includeArchived bool) [
 	return filtered
 }
 
-func queryIncludesArchived(values url.Values) bool {
-	includeArchived := strings.TrimSpace(values.Get("archived"))
-	return includeArchived == "1" || strings.EqualFold(includeArchived, "true")
+func queryArchivedMode(values url.Values) string {
+	archived := strings.TrimSpace(values.Get("archived"))
+	switch {
+	case archived == "1", strings.EqualFold(archived, "true"), strings.EqualFold(archived, "include"):
+		return "include"
+	case strings.EqualFold(archived, "only"):
+		return "only"
+	default:
+		return "exclude"
+	}
 }
 
 func noteURL(id string) string {
@@ -2152,34 +2235,86 @@ func noteEditURL(id string) string {
 	return noteURL(id) + "/edit"
 }
 
-func tagURL(page, tag string, includeArchived bool) string {
-	values := url.Values{}
-	values.Set("tag", tag)
-	if includeArchived {
-		values.Set("archived", "1")
-	}
-	return page + "?" + values.Encode()
+func noteFilterURL(id string, filter webFilterOptions) string {
+	return noteURL(id) + filterQueryString(filter, true)
 }
 
-func clearTagURL(page string, includeArchived bool) string {
-	if !includeArchived {
-		return page
-	}
-	return page + "?archived=1"
-}
-
-func tasksURL(tag string, includeArchived bool) string {
+func tasksURL(filter webFilterOptions) string {
 	values := url.Values{}
-	if tag != "" {
-		values.Set("tag", tag)
+	for _, tag := range filter.Tags {
+		values.Add("tag", tag)
 	}
-	if includeArchived {
+	switch filter.ArchivedMode {
+	case "include":
 		values.Set("archived", "1")
+	case "only":
+		values.Set("archived", "only")
 	}
 	if encoded := values.Encode(); encoded != "" {
 		return "/tasks?" + encoded
 	}
 	return "/tasks"
+}
+
+func filterPageURL(page string, filter webFilterOptions) string {
+	return page + filterQueryString(filter, true)
+}
+
+func filterQueryString(filter webFilterOptions, includeQuery bool) string {
+	values := url.Values{}
+	if includeQuery && filter.Query != "" {
+		values.Set("q", filter.Query)
+	}
+	for _, tag := range filter.Tags {
+		values.Add("tag", tag)
+	}
+	switch filter.ArchivedMode {
+	case "include":
+		values.Set("archived", "1")
+	case "only":
+		values.Set("archived", "only")
+	}
+	if encoded := values.Encode(); encoded != "" {
+		return "?" + encoded
+	}
+	return ""
+}
+
+func buildTagFilters(page string, availableTags []string, filter webFilterOptions) []webTagFilter {
+	filters := make([]webTagFilter, 0, len(availableTags))
+	for _, tag := range availableTags {
+		next := webFilterOptions{
+			Query:        filter.Query,
+			Tags:         append([]string(nil), filter.Tags...),
+			ArchivedMode: filter.ArchivedMode,
+		}
+		active := hasAllTags(filter.Tags, []string{tag})
+		if active {
+			var remaining []string
+			for _, existing := range next.Tags {
+				if existing != tag {
+					remaining = append(remaining, existing)
+				}
+			}
+			next.Tags = remaining
+		} else {
+			next.Tags = normalizeTags(append(next.Tags, tag))
+		}
+		filters = append(filters, webTagFilter{
+			Name:   tag,
+			URL:    filterPageURL(page, next),
+			Active: active,
+		})
+	}
+	return filters
+}
+
+func clearTagFiltersURL(page string, filter webFilterOptions) string {
+	next := webFilterOptions{
+		Query:        filter.Query,
+		ArchivedMode: filter.ArchivedMode,
+	}
+	return filterPageURL(page, next)
 }
 
 func safeReturnURL(raw, fallback string) string {
@@ -3238,8 +3373,6 @@ func renderWikiLinks(text string, existing map[string]struct{}) string {
 
 func notebookPageTemplate() *template.Template {
 	return template.Must(template.New("notebook").Funcs(template.FuncMap{
-		"tagURL":         tagURL,
-		"clearTagURL":    clearTagURL,
 		"noteEditURL":    noteEditURL,
 		"noteHistoryURL": noteHistoryURL,
 	}).Parse(`<!doctype html>
@@ -3266,6 +3399,8 @@ func notebookPageTemplate() *template.Template {
     code { font-family: "SFMono-Regular", Consolas, monospace; font-size:0.92em; }
     .eyebrow { text-transform:uppercase; letter-spacing:0.08em; font-size:0.74rem; color:var(--muted); margin-bottom:0.4rem; }
     .subtitle { color:var(--muted); margin-bottom:1.25rem; }
+    .filter-form { display:grid; gap:0.75rem; margin-top:1rem; }
+    .filter-form .field input[type="search"], .filter-form .field input[type="text"], .filter-form .field select { width:100%; padding:0.7rem 0.8rem; border-radius:12px; border:1px solid var(--line); background:#fff; color:var(--ink); font:inherit; }
     .note-list { display:grid; gap:0.85rem; margin-top:1.25rem; }
     .note-item { display:block; padding:0.9rem 1rem; border-radius:14px; text-decoration:none; border:1px solid var(--line); background:#fff; }
     .note-item:hover { border-color:var(--accent); transform:translateY(-1px); transition:160ms ease; }
@@ -3325,20 +3460,38 @@ func notebookPageTemplate() *template.Template {
         <div class="eyebrow">Local notebook</div>
         <h1>{{.HeaderTitle}}</h1>
         <div class="subtitle">{{.HeaderSubtitle}}</div>
+        <form class="filter-form" method="get" action="{{.FilterPage}}">
+          <div class="field">
+            <label for="sidebar-search">Search</label>
+            <input id="sidebar-search" name="q" type="search" value="{{.SearchQuery}}" placeholder="Title or body">
+          </div>
+          <div class="field">
+            <label for="sidebar-tags">Tags</label>
+            <input id="sidebar-tags" name="tags" type="text" value="{{.FilterTagsInput}}" placeholder="work, review">
+            <div class="hint">Matches notes containing every listed tag.</div>
+          </div>
+          <div class="field">
+            <label for="sidebar-archived">Archived</label>
+            <select id="sidebar-archived" name="archived">
+              <option value="" {{if eq .ArchivedMode "exclude"}}selected{{end}}>Hide archived</option>
+              <option value="1" {{if eq .ArchivedMode "include"}}selected{{end}}>Include archived</option>
+              <option value="only" {{if eq .ArchivedMode "only"}}selected{{end}}>Archived only</option>
+            </select>
+          </div>
+          <div class="form-actions">
+            <button class="button" type="submit">Apply</button>
+            <a class="button secondary" href="{{.FilterPage}}">Reset</a>
+          </div>
+        </form>
         <div class="filters">
-          <a class="filter-link {{if eq .ActiveTag ""}}active{{end}}" href="{{clearTagURL .FilterPage .IncludeArchived}}">All</a>
-          {{range .AvailableTags}}
-            <a class="filter-link {{if eq $.ActiveTag .}}active{{end}}" href="{{tagURL $.FilterPage . $.IncludeArchived}}">#{{.}}</a>
+          <a class="filter-link {{if eq (len .ActiveTags) 0}}active{{end}}" href="{{.ClearTagsURL}}">All</a>
+          {{range .TagFilters}}
+            <a class="filter-link {{if .Active}}active{{end}}" href="{{.URL}}">#{{.Name}}</a>
           {{end}}
         </div>
         <div class="toolbar">
           <a class="button secondary" href="/new">New note</a>
           <a class="button secondary" href="{{.TasksPageURL}}">Open tasks</a>
-          {{if .IncludeArchived}}
-            <a class="toggle" href="{{if .ActiveTag}}{{tagURL .FilterPage .ActiveTag false}}{{else}}{{.FilterPage}}{{end}}">Hide archived</a>
-          {{else}}
-            <a class="toggle" href="{{if .ActiveTag}}{{tagURL .FilterPage .ActiveTag true}}{{else}}{{clearTagURL .FilterPage true}}{{end}}">Show archived</a>
-          {{end}}
         </div>
         <div class="note-list">
           {{range .Notes}}
@@ -3349,6 +3502,7 @@ func notebookPageTemplate() *template.Template {
                 {{if .Archived}}<span class="archived">archived</span>{{end}}
                 {{if .Tags}}{{range .Tags}}<span class="tag">#{{.}}</span>{{end}}{{end}}
               </div>
+              <p>{{.Snippet}}</p>
               <div class="meta">{{.LinksCount}} links · {{.Backlinks}} backlinks{{if .BrokenLinks}} · {{len .BrokenLinks}} broken{{end}}</div>
             </a>
           {{else}}

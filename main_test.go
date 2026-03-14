@@ -2125,6 +2125,79 @@ func TestServeIndexPageRendersTagFilterAndWarnings(t *testing.T) {
 	if !strings.Contains(body, "1 broken") {
 		t.Fatalf("expected broken-link summary in sidebar, got %q", body)
 	}
+	if !strings.Contains(body, `name="q" type="search"`) {
+		t.Fatalf("expected search form in sidebar, got %q", body)
+	}
+}
+
+func TestServeIndexPageSearchMatchesBodyAndPreservesFiltersInLinks(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("project-ideas"), []byte("# Project Ideas\nTags: work, writing\n\nBuild a search command.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("weekly-review"), []byte("# Weekly Review\nTags: review\n\nSearch indexing can wait.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/?q=search&tags=work,writing", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Project Ideas") {
+		t.Fatalf("expected matching note in body, got %q", body)
+	}
+	if strings.Contains(body, "Weekly Review</strong>") {
+		t.Fatalf("expected non-matching tag-filtered note to be hidden, got %q", body)
+	}
+	if !strings.Contains(body, "Build a search command.") {
+		t.Fatalf("expected search snippet in sidebar, got %q", body)
+	}
+	if !strings.Contains(body, `href="/notes/project-ideas?q=search&amp;tag=work&amp;tag=writing"`) {
+		t.Fatalf("expected note links to preserve active search filters, got %q", body)
+	}
+}
+
+func TestServeIndexPageCanShowArchivedOnlySearchResults(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("active-note"), []byte("# Active Note\nTags: search\n\nSearch is live.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("old-note"), []byte("# Old Note\nTags: search\nArchived: true\n\nSearch is retired.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/?q=search&archived=only", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, "Active Note</strong>") {
+		t.Fatalf("expected active note to be filtered out, got %q", body)
+	}
+	if !strings.Contains(body, "Old Note") || !strings.Contains(body, "archived") {
+		t.Fatalf("expected archived search result, got %q", body)
+	}
 }
 
 func TestServeNotePageRendersBacklinksAndBrokenWarning(t *testing.T) {
