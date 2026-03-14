@@ -9,6 +9,7 @@ go run . create "Daily Log" "Shipped the first version."
 go run . edit daily-log "Replaced the body from the CLI."
 EDITOR=vim go run . edit daily-log
 go run . list
+go run . search shipped
 go run . view daily-log
 go run . delete daily-log
 ```
@@ -18,5 +19,6 @@ go run . delete daily-log
 - `create` writes a Markdown file with a heading based on the note title.
 - `edit` updates an existing note either by replacing the body from the CLI or opening the file in `$EDITOR`.
 - `list` shows note ID, last modified timestamp, and title.
+- `search` performs case-insensitive full-text search across note titles and bodies.
 - `view` prints the raw Markdown note content.
 - `delete` removes the note file from `notes/`.

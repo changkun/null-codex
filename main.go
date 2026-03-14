@@ -41,6 +41,8 @@ func run(args []string) error {
 		return editNote(args[1:])
 	case "list", "ls":
 		return listNotes()
+	case "search":
+		return searchNotes(args[1:])
 	case "view", "show":
 		return viewNote(args[1:])
 	case "delete", "rm":
@@ -89,49 +91,57 @@ func createNote(args []string) error {
 }
 
 func listNotes() error {
-	entries, err := os.ReadDir(notesDir)
+	notes, err := loadNotes()
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			fmt.Println("no notes found")
-			return nil
-		}
 		return err
 	}
-
-	var notes []noteMeta
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-
-		id := strings.TrimSuffix(entry.Name(), ".md")
-		title, err := readTitle(notePath(id))
-		if err != nil {
-			return err
-		}
-
-		notes = append(notes, noteMeta{
-			ID:      id,
-			Title:   title,
-			ModTime: info.ModTime(),
-		})
-	}
-
 	if len(notes) == 0 {
 		fmt.Println("no notes found")
 		return nil
 	}
 
-	sort.Slice(notes, func(i, j int) bool {
-		return notes[i].ModTime.After(notes[j].ModTime)
-	})
-
 	for _, note := range notes {
+		fmt.Printf("%s\t%s\t%s\n", note.ID, note.ModTime.Format(time.RFC3339), note.Title)
+	}
+
+	return nil
+}
+
+func searchNotes(args []string) error {
+	if len(args) == 0 {
+		return errors.New("search requires a query")
+	}
+
+	query := strings.TrimSpace(strings.Join(args, " "))
+	if query == "" {
+		return errors.New("search query cannot be empty")
+	}
+
+	notes, err := loadNotes()
+	if err != nil {
+		return err
+	}
+
+	query = strings.ToLower(query)
+	var matches []noteMeta
+	for _, note := range notes {
+		body, err := os.ReadFile(notePath(note.ID))
+		if err != nil {
+			return err
+		}
+
+		searchText := strings.ToLower(note.Title + "\n" + string(body))
+		if strings.Contains(searchText, query) {
+			matches = append(matches, note)
+		}
+	}
+
+	if len(matches) == 0 {
+		fmt.Println("no matching notes found")
+		return nil
+	}
+
+	for _, note := range matches {
 		fmt.Printf("%s\t%s\t%s\n", note.ID, note.ModTime.Format(time.RFC3339), note.Title)
 	}
 
@@ -264,6 +274,46 @@ func readTitle(path string) (string, error) {
 	return strings.TrimSuffix(filepath.Base(path), ".md"), nil
 }
 
+func loadNotes() ([]noteMeta, error) {
+	entries, err := os.ReadDir(notesDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var notes []noteMeta
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+
+		id := strings.TrimSuffix(entry.Name(), ".md")
+		title, err := readTitle(notePath(id))
+		if err != nil {
+			return nil, err
+		}
+
+		notes = append(notes, noteMeta{
+			ID:      id,
+			Title:   title,
+			ModTime: info.ModTime(),
+		})
+	}
+
+	sort.Slice(notes, func(i, j int) bool {
+		return notes[i].ModTime.After(notes[j].ModTime)
+	})
+
+	return notes, nil
+}
+
 func notePath(id string) string {
 	return filepath.Join(notesDir, id+".md")
 }
@@ -303,6 +353,7 @@ func printUsage() {
 	fmt.Println("  create <title> [content]  Create a Markdown note")
 	fmt.Println("  edit <id> [content]       Replace note body or open in $EDITOR")
 	fmt.Println("  list                      List saved notes")
+	fmt.Println("  search <query>            Search note titles and bodies")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  delete <id>               Delete a note")
 }

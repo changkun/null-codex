@@ -1,0 +1,3 @@
+{
+  "result": "Next goal: add a `search` command that performs full-text search across note titles and bodies, so the CLI becomes useful once the `notes/` directory grows beyond a handful of files."
+}
