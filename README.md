@@ -20,6 +20,9 @@ go run . history daily-log 20260314T090000.000000000Z-0001-edit
 go run . restore daily-log 20260314T090000.000000000Z-0001-edit
 EDITOR=vim go run . edit daily-log
 EDITOR=vim go run . today
+go run . inbox "Capture this before I forget"
+go run . inbox --task "Follow up with the API team"
+go run . inbox https://example.com/article
 go run . list --tag work
 go run . list --include-archived
 go run . list --archived-only
@@ -57,6 +60,7 @@ go run . sync
 - `tasks toggle <id> <line>` flips the checkbox state for the Markdown task at that file line and records the change in note history.
 - `search` performs case-insensitive full-text search across note titles and bodies, can be narrowed to notes matching all requested tags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `today` creates `notes/YYYY-MM-DD.md` from the built-in daily template when missing and opens today's daily note in `$EDITOR`.
+- `inbox` appends a timestamped bullet to the dedicated `notes/inbox.md` note for low-friction capture; pass `--task` to store the entry as an open Markdown checkbox.
 - `view` prints the raw Markdown note content.
 - `links` lists the note IDs referenced by `[[note-id]]` links in a note body.
 - `backlinks` lists the note IDs that link to the requested note.

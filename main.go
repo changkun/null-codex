@@ -21,9 +21,13 @@ import (
 	"unicode"
 )
 
-const notesDir = "notes"
-const noteHistoryDir = ".history"
-const noteTemplateDir = "templates"
+const (
+	notesDir        = "notes"
+	noteHistoryDir  = ".history"
+	noteTemplateDir = "templates"
+	inboxNoteID     = "inbox"
+	inboxNoteTitle  = "Inbox"
+)
 
 var noteLinkPattern = regexp.MustCompile(`\[\[([^\[\]]+)\]\]`)
 var inlineCodePattern = regexp.MustCompile("`([^`]+)`")
@@ -310,6 +314,8 @@ func run(args []string) error {
 		return renameNote(args[1:])
 	case "today":
 		return openTodayNote()
+	case "inbox":
+		return captureInbox(args[1:])
 	case "view", "show":
 		return viewNote(args[1:])
 	case "links":
@@ -624,6 +630,45 @@ func openTodayNote() error {
 	}
 
 	return openNoteInEditor(today)
+}
+
+func captureInbox(args []string) error {
+	entry, asTask, err := parseInboxArgs(args)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		return err
+	}
+
+	content, existing, err := loadOrCreateInboxNote()
+	if err != nil {
+		return err
+	}
+
+	line := formatInboxEntry(entry, asTask)
+	if content.Body == "" {
+		content.Body = line
+	} else {
+		content.Body += "\n" + line
+	}
+
+	formatted := formatNote(content)
+	if !existing {
+		if err := os.WriteFile(notePath(inboxNoteID), []byte(formatted), 0o644); err != nil {
+			return err
+		}
+		if err := appendHistoryVersion(inboxNoteID, "create", []byte(formatted)); err != nil {
+			return err
+		}
+	} else {
+		if err := writeNoteVersioned(inboxNoteID, "inbox-capture", []byte(formatted)); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("captured to %s\n", inboxNoteID)
+	return nil
 }
 
 func editNote(args []string) error {
@@ -1924,6 +1969,21 @@ func readTitle(path string) (string, error) {
 		return "", err
 	}
 	return content.Title, nil
+}
+
+func loadOrCreateInboxNote() (noteContent, bool, error) {
+	path := notePath(inboxNoteID)
+	content, err := readNoteContent(path)
+	if err == nil {
+		return content, true, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return noteContent{}, false, err
+	}
+	return noteContent{
+		Title: inboxNoteTitle,
+		Tags:  []string{"inbox"},
+	}, false, nil
 }
 
 func readNoteContent(path string) (noteContent, error) {
@@ -4303,6 +4363,7 @@ func printUsage() {
 	fmt.Println("  tasks [--tag <tag>]... [--include-archived|--archived-only]  List open Markdown checkbox tasks with line numbers")
 	fmt.Println("  tasks toggle <id> <line>   Toggle a Markdown checkbox task by file line")
 	fmt.Println("  today                     Create or open today's daily note")
+	fmt.Println("  inbox [--task] <text>     Append a quick capture to the inbox note")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  links <id>                List outgoing [[note-id]] links from a note")
 	fmt.Println("  backlinks <id>            List notes that link to a note")
@@ -4312,4 +4373,39 @@ func printUsage() {
 	fmt.Println("  restore <id> <version>    Restore a note from local history")
 	fmt.Println("  doctor [--fix] [--report] Check for broken wiki links and orphaned notes")
 	fmt.Println("  sync                      Commit note changes and pull/push notes/ to its Git upstream")
+}
+
+func parseInboxArgs(args []string) (string, bool, error) {
+	var bodyParts []string
+	asTask := false
+	parseFlags := true
+
+	for _, arg := range args {
+		if parseFlags && arg == "--" {
+			parseFlags = false
+			continue
+		}
+		if parseFlags && arg == "--task" {
+			asTask = true
+			continue
+		}
+		if parseFlags && strings.HasPrefix(arg, "--") {
+			return "", false, fmt.Errorf("unknown flag %q", arg)
+		}
+		bodyParts = append(bodyParts, arg)
+	}
+
+	body := strings.TrimSpace(strings.Join(bodyParts, " "))
+	if body == "" {
+		return "", false, errors.New("inbox requires text to capture")
+	}
+	return body, asTask, nil
+}
+
+func formatInboxEntry(body string, asTask bool) string {
+	stamp := now().UTC().Format("2006-01-02 15:04 UTC")
+	if asTask {
+		return fmt.Sprintf("- [ ] [%s] %s", stamp, body)
+	}
+	return fmt.Sprintf("- [%s] %s", stamp, body)
 }

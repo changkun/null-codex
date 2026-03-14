@@ -1495,6 +1495,91 @@ func TestOpenTodayNoteKeepsExistingBody(t *testing.T) {
 	}
 }
 
+func TestCaptureInboxCreatesDedicatedInboxNote(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	output := captureStdout(t, func() {
+		if err := captureInbox([]string{"Remember", "the", "milk"}); err != nil {
+			t.Fatalf("captureInbox returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(notePath("inbox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "# Inbox\nTags: inbox\n\n- [2026-03-14 09:00 UTC] Remember the milk\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+	if output != "captured to inbox\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+
+	historyOutput := captureStdout(t, func() {
+		if err := historyNote([]string{"inbox"}); err != nil {
+			t.Fatalf("historyNote returned error: %v", err)
+		}
+	})
+	if !strings.Contains(historyOutput, "\tcreate\n") {
+		t.Fatalf("expected inbox creation history, got %q", historyOutput)
+	}
+}
+
+func TestCaptureInboxAppendsTasksToExistingNote(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 5, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("inbox"), []byte("# Inbox\nTags: inbox\n\n- [2026-03-14 09:00 UTC] Existing thought\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := captureInbox([]string{"--task", "Follow", "up", "with", "design"}); err != nil {
+		t.Fatalf("captureInbox returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("inbox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "# Inbox\nTags: inbox\n\n- [2026-03-14 09:00 UTC] Existing thought\n- [ ] [2026-03-14 09:05 UTC] Follow up with design\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+
+	historyOutput := captureStdout(t, func() {
+		if err := historyNote([]string{"inbox"}); err != nil {
+			t.Fatalf("historyNote returned error: %v", err)
+		}
+	})
+	if !strings.Contains(historyOutput, "\tinbox-capture\n") {
+		t.Fatalf("expected inbox capture history, got %q", historyOutput)
+	}
+}
+
+func TestRunIncludesInboxCommand(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := run([]string{"inbox", "https://example.com"}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("inbox"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "https://example.com") {
+		t.Fatalf("expected inbox note to contain captured link, got %q", string(got))
+	}
+}
+
 func TestRunIncludesTodayCommand(t *testing.T) {
 	withTempDir(t)
 	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
