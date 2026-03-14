@@ -35,6 +35,7 @@ go run . backlinks daily-log
 go run . graph
 go run . serve
 go run . serve --addr 127.0.0.1:9090
+go run . serve --watch
 go run . delete daily-log
 go run . doctor
 go run . doctor --fix --report
@@ -60,7 +61,7 @@ go run . sync
 - `links` lists the note IDs referenced by `[[note-id]]` links in a note body.
 - `backlinks` lists the note IDs that link to the requested note.
 - `graph` emits the notebook's `[[note-id]]` link structure as Graphviz DOT, including dashed nodes for missing link targets.
-- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, surfaces a notebook-wide open task view at `/tasks`, supports toggling Markdown checkboxes from note pages and the task view, and supports creating and editing notes directly in the browser.
+- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, surfaces a notebook-wide open task view at `/tasks`, supports toggling Markdown checkboxes from note pages and the task view, and supports creating and editing notes directly in the browser. Pass `--watch` to poll `notes/`, rebuild the link/task index automatically, and reload open browser views when files change on disk.
 - `delete` removes the note file from `notes/`.
 - `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets. `doctor --fix` creates stub notes for missing link targets, and `--report` lists each created stub note.
 - `sync` treats `notes/` as its own Git repository, stages notebook changes, creates a `sync notebook <timestamp>` commit when needed, then runs `git pull --rebase` and `git push` against the branch upstream configured for `notes/`.

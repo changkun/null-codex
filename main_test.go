@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
@@ -1883,17 +1884,119 @@ func TestRenderMarkdownHTMLRendersToggleFormsWhenTaskContextPresent(t *testing.T
 }
 
 func TestParseServeOptions(t *testing.T) {
-	opts, err := parseServeOptions([]string{"--addr", ":9999"})
+	opts, err := parseServeOptions([]string{"--addr", ":9999", "--watch"})
 	if err != nil {
 		t.Fatalf("parseServeOptions returned error: %v", err)
 	}
 	if opts.Addr != ":9999" {
 		t.Fatalf("unexpected addr: %q", opts.Addr)
 	}
+	if !opts.Watch {
+		t.Fatal("expected watch mode to be enabled")
+	}
 
 	_, err = parseServeOptions([]string{"--addr"})
 	if err == nil || err.Error() != "--addr requires a value" {
 		t.Fatalf("expected addr value error, got %v", err)
+	}
+}
+
+func TestNotebookServerRefreshUpdatesSnapshot(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("project"), []byte("# Project\n\nInitial body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := newNotebookServer(true)
+	if err != nil {
+		t.Fatalf("newNotebookServer returned error: %v", err)
+	}
+	if got := server.snapshotCopy().RenderedNotes["project"].RenderedBody; !strings.Contains(string(got), "Initial body.") {
+		t.Fatalf("expected initial snapshot body, got %q", string(got))
+	}
+
+	updated := "# Project\nTags: work\n\nUpdated body.\n- [ ] Follow up\n"
+	if err := os.WriteFile(notePath("project"), []byte(updated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.refresh(); err != nil {
+		t.Fatalf("refresh returned error: %v", err)
+	}
+
+	snapshot := server.snapshotCopy()
+	if !strings.Contains(snapshot.NotesByID["project"].Body, "Updated body.") {
+		t.Fatalf("expected refreshed note body, got %#v", snapshot.NotesByID["project"])
+	}
+	if len(snapshot.TaskGroups) != 1 || len(snapshot.TaskGroups[0].Tasks) != 1 {
+		t.Fatalf("expected refreshed task index, got %#v", snapshot.TaskGroups)
+	}
+}
+
+func TestServeEventsStreamsRefreshNotifications(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("project"), []byte("# Project\n\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	serverState, err := newNotebookServer(true)
+	if err != nil {
+		t.Fatalf("newNotebookServer returned error: %v", err)
+	}
+	testServer := httptest.NewServer(newServeMux(serverState))
+	defer testServer.Close()
+
+	resp, err := testServer.Client().Get(testServer.URL + "/events")
+	if err != nil {
+		t.Fatalf("GET /events returned error: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("unexpected content type: %q", got)
+	}
+
+	lines := make(chan string, 8)
+	readErr := make(chan error, 1)
+	go func() {
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				readErr <- err
+				return
+			}
+			lines <- line
+		}
+	}()
+
+	if err := os.WriteFile(notePath("project"), []byte("# Project\n\nChanged.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := serverState.refresh(); err != nil {
+		t.Fatalf("refresh returned error: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	var body strings.Builder
+	for {
+		select {
+		case line := <-lines:
+			body.WriteString(line)
+			if strings.Contains(body.String(), "event: refresh") {
+				return
+			}
+		case err := <-readErr:
+			t.Fatalf("reading event stream failed: %v", err)
+		case <-deadline:
+			t.Fatalf("timed out waiting for refresh event, got %q", body.String())
+		}
 	}
 }
 

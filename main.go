@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -77,7 +78,8 @@ type noteVersion struct {
 }
 
 type serveOptions struct {
-	Addr string
+	Addr  string
+	Watch bool
 }
 
 type doctorOptions struct {
@@ -125,6 +127,7 @@ type notebookPageData struct {
 	CurrentNote     *webNoteDetail
 	NoteHistory     *webNoteHistory
 	NoteForm        *webNoteForm
+	LiveReload      bool
 }
 
 type webNoteSummary struct {
@@ -235,6 +238,14 @@ type notebookSnapshot struct {
 	RenderedNotes map[string]webNoteDetail
 	TaskGroups    []webTaskGroup
 	Tags          []string
+}
+
+type notebookServer struct {
+	mu         sync.RWMutex
+	snapshot   notebookSnapshot
+	watch      bool
+	version    int64
+	subscribers map[chan int64]struct{}
 }
 
 func main() {
@@ -782,33 +793,146 @@ func serveNotes(args []string) error {
 		return err
 	}
 
+	serverState, err := newNotebookServer(opts.Watch)
+	if err != nil {
+		return err
+	}
+	if opts.Watch {
+		go watchNotebook(serverState, 500*time.Millisecond)
+	}
+
 	server := &http.Server{
 		Addr:    opts.Addr,
-		Handler: newServeMux(),
+		Handler: newServeMux(serverState),
 	}
 
 	fmt.Printf("serving notebook at http://%s\n", normalizeServeAddr(opts.Addr))
 	return server.ListenAndServe()
 }
 
-func newServeMux() http.Handler {
+func newNotebookServer(watch bool) (*notebookServer, error) {
+	snapshot, err := buildNotebookSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return &notebookServer{
+		snapshot:    snapshot,
+		watch:       watch,
+		subscribers: make(map[chan int64]struct{}),
+	}, nil
+}
+
+func (s *notebookServer) snapshotCopy() notebookSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.snapshot
+}
+
+func (s *notebookServer) currentSnapshot() (notebookSnapshot, error) {
+	if s.watch {
+		return s.snapshotCopy(), nil
+	}
+	return buildNotebookSnapshot()
+}
+
+func (s *notebookServer) refresh() error {
+	snapshot, err := buildNotebookSnapshot()
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.snapshot = snapshot
+	s.version++
+	version := s.version
+	subscribers := make([]chan int64, 0, len(s.subscribers))
+	for ch := range s.subscribers {
+		subscribers = append(subscribers, ch)
+	}
+	s.mu.Unlock()
+
+	for _, ch := range subscribers {
+		select {
+		case ch <- version:
+		default:
+		}
+	}
+	return nil
+}
+
+func (s *notebookServer) subscribe() (chan int64, func()) {
+	ch := make(chan int64, 1)
+	s.mu.Lock()
+	s.subscribers[ch] = struct{}{}
+	s.mu.Unlock()
+	return ch, func() {
+		s.mu.Lock()
+		delete(s.subscribers, ch)
+		s.mu.Unlock()
+	}
+}
+
+func newServeMux(server *notebookServer) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", serveIndexPage)
-	mux.HandleFunc("/tasks/toggle", serveToggleTask)
-	mux.HandleFunc("/tasks", serveTasksPage)
-	mux.HandleFunc("/new", serveCreateNotePage)
-	mux.HandleFunc("/notes", serveCreateNote)
-	mux.HandleFunc("/notes/", serveNotePage)
+	mux.HandleFunc("/", server.serveIndexPage)
+	mux.HandleFunc("/events", server.serveEvents)
+	mux.HandleFunc("/tasks/toggle", server.serveToggleTask)
+	mux.HandleFunc("/tasks", server.serveTasksPage)
+	mux.HandleFunc("/new", server.serveCreateNotePage)
+	mux.HandleFunc("/notes", server.serveCreateNote)
+	mux.HandleFunc("/notes/", server.serveNotePage)
 	return mux
 }
 
-func serveIndexPage(w http.ResponseWriter, r *http.Request) {
+func watchNotebook(server *notebookServer, interval time.Duration) {
+	signature, _ := notebookWatchSignature()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		next, err := notebookWatchSignature()
+		if err != nil {
+			continue
+		}
+		if next == signature {
+			continue
+		}
+		if err := server.refresh(); err == nil {
+			signature = next
+		}
+	}
+}
+
+func notebookWatchSignature() (string, error) {
+	entries, err := os.ReadDir(notesDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	var b strings.Builder
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "%s|%d|%d\n", entry.Name(), info.Size(), info.ModTime().UnixNano())
+	}
+	return b.String(), nil
+}
+
+func (s *notebookServer) serveIndexPage(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
 
-	snapshot, err := buildNotebookSnapshot()
+	snapshot, err := s.currentSnapshot()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -828,13 +952,55 @@ func serveIndexPage(w http.ResponseWriter, r *http.Request) {
 		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
+		LiveReload:      s.watch,
 	}
 
 	data.Notes = notes
 	renderNotebookPage(w, data)
 }
 
-func serveTasksPage(w http.ResponseWriter, r *http.Request) {
+func (s *notebookServer) serveEvents(w http.ResponseWriter, r *http.Request) {
+	if !s.watch {
+		http.NotFound(w, r)
+		return
+	}
+	if r.URL.Path != "/events" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ch, unsubscribe := s.subscribe()
+	defer unsubscribe()
+
+	fmt.Fprint(w, ": connected\n\n")
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case version := <-ch:
+			fmt.Fprintf(w, "event: refresh\ndata: %d\n\n", version)
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *notebookServer) serveTasksPage(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/tasks" {
 		http.NotFound(w, r)
 		return
@@ -844,12 +1010,11 @@ func serveTasksPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snapshot, err := buildNotebookSnapshot()
+	snapshot, err := s.currentSnapshot()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	filter := parseWebFilterOptions(r.URL.Query())
 	taskGroups := filterTaskGroups(snapshot.TaskGroups, filter)
 	taskCount := 0
@@ -872,11 +1037,12 @@ func serveTasksPage(w http.ResponseWriter, r *http.Request) {
 		TasksPageURL:    tasksURL(filter),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		TaskGroups:      taskGroups,
+		LiveReload:      s.watch,
 	}
 	renderNotebookPage(w, data)
 }
 
-func serveToggleTask(w http.ResponseWriter, r *http.Request) {
+func (s *notebookServer) serveToggleTask(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -902,11 +1068,15 @@ func serveToggleTask(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), status)
 		return
 	}
+	if err := s.refresh(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	http.Redirect(w, r, safeReturnURL(r.FormValue("return_to"), noteURL(id)), http.StatusSeeOther)
 }
 
-func serveCreateNotePage(w http.ResponseWriter, r *http.Request) {
+func (s *notebookServer) serveCreateNotePage(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/new" {
 		http.NotFound(w, r)
 		return
@@ -916,7 +1086,7 @@ func serveCreateNotePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snapshot, err := buildNotebookSnapshot()
+	snapshot, err := s.currentSnapshot()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -945,7 +1115,7 @@ func serveCreateNotePage(w http.ResponseWriter, r *http.Request) {
 	renderNotebookPage(w, data)
 }
 
-func serveCreateNote(w http.ResponseWriter, r *http.Request) {
+func (s *notebookServer) serveCreateNote(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/notes" {
 		http.NotFound(w, r)
 		return
@@ -972,14 +1142,18 @@ func serveCreateNote(w http.ResponseWriter, r *http.Request) {
 
 	id, err := createWebNote(form)
 	if err != nil {
-		renderWebFormError(w, r, http.StatusBadRequest, "New Note", "Create a notebook entry in the browser", form, err)
+		s.renderWebFormError(w, r, http.StatusBadRequest, "New Note", "Create a notebook entry in the browser", form, err)
+		return
+	}
+	if err := s.refresh(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	http.Redirect(w, r, noteURL(id), http.StatusSeeOther)
 }
 
-func serveNotePage(w http.ResponseWriter, r *http.Request) {
+func (s *notebookServer) serveNotePage(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/notes/")
 	path = strings.TrimSpace(strings.Trim(path, "/"))
 	isHistoryRestoreRoute := strings.HasSuffix(path, "/history/restore")
@@ -1011,7 +1185,7 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		serveEditNotePage(w, r, id)
+		s.serveEditNotePage(w, r, id)
 		return
 	}
 	if isHistoryRestoreRoute {
@@ -1019,7 +1193,7 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		serveRestoreNote(w, r, id)
+		s.serveRestoreNote(w, r, id)
 		return
 	}
 	if isHistoryRoute {
@@ -1027,12 +1201,12 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		serveNoteHistoryPage(w, r, id)
+		s.serveNoteHistoryPage(w, r, id)
 		return
 	}
 
 	if r.Method == http.MethodPost {
-		serveUpdateNote(w, r, id)
+		s.serveUpdateNote(w, r, id)
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -1040,12 +1214,11 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snapshot, err := buildNotebookSnapshot()
+	snapshot, err := s.currentSnapshot()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	detail, ok := snapshot.RenderedNotes[id]
 	if !ok {
 		http.NotFound(w, r)
@@ -1067,6 +1240,7 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 		TasksPageURL:    tasksURL(filter),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		CurrentNote:     &detail,
+		LiveReload:      s.watch,
 	}
 	renderNotebookPage(w, data)
 }
@@ -1083,13 +1257,12 @@ func renderNotebookPageStatus(w http.ResponseWriter, status int, data notebookPa
 	}
 }
 
-func serveNoteHistoryPage(w http.ResponseWriter, r *http.Request, id string) {
-	snapshot, err := buildNotebookSnapshot()
+func (s *notebookServer) serveNoteHistoryPage(w http.ResponseWriter, r *http.Request, id string) {
+	snapshot, err := s.currentSnapshot()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	detail, ok := snapshot.RenderedNotes[id]
 	if !ok {
 		http.NotFound(w, r)
@@ -1125,17 +1298,17 @@ func serveNoteHistoryPage(w http.ResponseWriter, r *http.Request, id string) {
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		CurrentNote:     &detail,
 		NoteHistory:     history,
+		LiveReload:      s.watch,
 	}
 	renderNotebookPage(w, data)
 }
 
-func serveEditNotePage(w http.ResponseWriter, r *http.Request, id string) {
-	snapshot, err := buildNotebookSnapshot()
+func (s *notebookServer) serveEditNotePage(w http.ResponseWriter, r *http.Request, id string) {
+	snapshot, err := s.currentSnapshot()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	detail, ok := snapshot.RenderedNotes[id]
 	if !ok {
 		http.NotFound(w, r)
@@ -1176,7 +1349,7 @@ func serveEditNotePage(w http.ResponseWriter, r *http.Request, id string) {
 	renderNotebookPage(w, data)
 }
 
-func serveUpdateNote(w http.ResponseWriter, r *http.Request, id string) {
+func (s *notebookServer) serveUpdateNote(w http.ResponseWriter, r *http.Request, id string) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1194,14 +1367,18 @@ func serveUpdateNote(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	if err := updateWebNote(id, form); err != nil {
-		renderWebFormError(w, r, http.StatusBadRequest, "Edit Note", id, form, err)
+		s.renderWebFormError(w, r, http.StatusBadRequest, "Edit Note", id, form, err)
+		return
+	}
+	if err := s.refresh(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	http.Redirect(w, r, noteURL(id), http.StatusSeeOther)
 }
 
-func serveRestoreNote(w http.ResponseWriter, r *http.Request, id string) {
+func (s *notebookServer) serveRestoreNote(w http.ResponseWriter, r *http.Request, id string) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1222,17 +1399,20 @@ func serveRestoreNote(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, err.Error(), status)
 		return
 	}
+	if err := s.refresh(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	http.Redirect(w, r, noteURL(id), http.StatusSeeOther)
 }
 
-func renderWebFormError(w http.ResponseWriter, r *http.Request, status int, headerTitle, headerSubtitle string, form webNoteForm, err error) {
-	snapshot, snapshotErr := buildNotebookSnapshot()
-	if snapshotErr != nil {
-		http.Error(w, snapshotErr.Error(), http.StatusInternalServerError)
+func (s *notebookServer) renderWebFormError(w http.ResponseWriter, r *http.Request, status int, headerTitle, headerSubtitle string, form webNoteForm, err error) {
+	snapshot, err := s.currentSnapshot()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	form.Error = err.Error()
 	filter := parseWebFilterOptions(r.URL.Query())
 	data := notebookPageData{
@@ -1249,6 +1429,7 @@ func renderWebFormError(w http.ResponseWriter, r *http.Request, status int, head
 		TasksPageURL:    tasksURL(filter),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		NoteForm:        &form,
+		LiveReload:      false,
 	}
 	renderNotebookPageStatus(w, status, data)
 }
@@ -2449,6 +2630,8 @@ func parseServeOptions(args []string) (serveOptions, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
+		case arg == "--watch":
+			opts.Watch = true
 		case arg == "--addr":
 			if i+1 >= len(args) {
 				return serveOptions{}, errors.New("--addr requires a value")
@@ -3662,6 +3845,14 @@ func notebookPageTemplate() *template.Template {
       </div>
     </main>
   </div>
+  {{if .LiveReload}}
+  <script>
+    if (window.EventSource) {
+      const events = new EventSource("/events");
+      events.addEventListener("refresh", () => window.location.reload());
+    }
+  </script>
+  {{end}}
 </body>
 </html>`))
 }
@@ -3864,7 +4055,7 @@ func printUsage() {
 	fmt.Println("  links <id>                List outgoing [[note-id]] links from a note")
 	fmt.Println("  backlinks <id>            List notes that link to a note")
 	fmt.Println("  graph                     Emit the notebook link graph as Graphviz DOT")
-	fmt.Println("  serve [--addr host:port]  Serve a local web UI for browsing rendered notes")
+	fmt.Println("  serve [--addr host:port] [--watch]  Serve a local web UI for browsing rendered notes")
 	fmt.Println("  delete <id>               Delete a note")
 	fmt.Println("  restore <id> <version>    Restore a note from local history")
 	fmt.Println("  doctor [--fix] [--report] Check for broken wiki links and orphaned notes")
