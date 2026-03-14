@@ -1,0 +1,3 @@
+{
+  "result": "Add a `tasks` feature that indexes Markdown checkboxes across all notes and shows every open task, grouped by note, with tag and archived filters in both the CLI and web UI."
+}

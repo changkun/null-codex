@@ -23,6 +23,8 @@ EDITOR=vim go run . today
 go run . list --tag work
 go run . list --include-archived
 go run . list --archived-only
+go run . tasks --tag work
+go run . tasks --include-archived
 go run . search shipped --tag work
 go run . search shipped --include-archived
 go run . search --tag review
@@ -48,13 +50,14 @@ go run . doctor --fix --report
 - `rename` changes a note's ID by renaming the Markdown file and updates `[[note-id]]` references across `notes/` without altering note titles, tags, archive status, or non-link body content.
 - `restore` rewrites a note from one saved version so you can safely roll back or recover a deleted note locally.
 - `list` shows note ID, last modified timestamp, title, and tags, filters with repeated `--tag` flags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
+- `tasks` indexes Markdown checkbox items like `- [ ] follow up` across all notes, groups every open task by note, filters with repeated `--tag` flags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `search` performs case-insensitive full-text search across note titles and bodies, can be narrowed to notes matching all requested tags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `today` creates `notes/YYYY-MM-DD.md` from the built-in daily template when missing and opens today's daily note in `$EDITOR`.
 - `view` prints the raw Markdown note content.
 - `links` lists the note IDs referenced by `[[note-id]]` links in a note body.
 - `backlinks` lists the note IDs that link to the requested note.
 - `graph` emits the notebook's `[[note-id]]` link structure as Graphviz DOT, including dashed nodes for missing link targets.
-- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, and now supports creating and editing notes directly in the browser.
+- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, surfaces a notebook-wide open task view at `/tasks`, and supports creating and editing notes directly in the browser.
 - `delete` removes the note file from `notes/`.
 - `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets. `doctor --fix` creates stub notes for missing link targets, and `--report` lists each created stub note.
 

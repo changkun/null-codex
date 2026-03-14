@@ -48,6 +48,13 @@ type searchResult struct {
 	Snippet string
 }
 
+type noteTask struct {
+	Text   string
+	Line   int
+	Open   bool
+	Source string
+}
+
 type brokenLink struct {
 	Source string
 	Target string
@@ -103,7 +110,11 @@ type notebookPageData struct {
 	ActiveTag       string
 	AvailableTags   []string
 	IncludeArchived bool
+	FilterPage      string
+	ShowTasks       bool
+	TasksPageURL    string
 	Notes           []webNoteSummary
+	TaskGroups      []webTaskGroup
 	CurrentNote     *webNoteDetail
 	NoteForm        *webNoteForm
 }
@@ -118,6 +129,21 @@ type webNoteSummary struct {
 	Backlinks    int
 	BrokenLinks  []string
 	DetailURL    string
+}
+
+type webTask struct {
+	Text string
+	Line int
+}
+
+type webTaskGroup struct {
+	ID        string
+	Title     string
+	Tags      []string
+	Archived  bool
+	ModTime   string
+	DetailURL string
+	Tasks     []webTask
 }
 
 type webNoteDetail struct {
@@ -155,6 +181,7 @@ type notebookSnapshot struct {
 	Notes         []webNoteSummary
 	NotesByID     map[string]webNoteSummary
 	RenderedNotes map[string]webNoteDetail
+	TaskGroups    []webTaskGroup
 	Tags          []string
 }
 
@@ -184,6 +211,8 @@ func run(args []string) error {
 		return listNotes(args[1:])
 	case "search":
 		return searchNotes(args[1:])
+	case "tasks":
+		return listTasks(args[1:])
 	case "archive":
 		return archiveNote(args[1:])
 	case "unarchive":
@@ -323,6 +352,63 @@ func searchNotes(args []string) error {
 			formatTags(match.Note.Tags),
 			match.Snippet,
 		)
+	}
+
+	return nil
+}
+
+func listTasks(args []string) error {
+	opts, err := parseFilterOptions(args)
+	if err != nil {
+		return err
+	}
+
+	notes, err := loadNotes()
+	if err != nil {
+		return err
+	}
+
+	notes = filterNotesByTags(notes, opts.Tags)
+	notes = filterArchivedNotes(notes, opts)
+
+	var groups []webTaskGroup
+	for _, note := range notes {
+		content, err := readNoteContent(notePath(note.ID))
+		if err != nil {
+			return err
+		}
+
+		tasks := openTasksFromBody(content.Body)
+		if len(tasks) == 0 {
+			continue
+		}
+
+		group := webTaskGroup{
+			ID:       note.ID,
+			Title:    note.Title,
+			Tags:     append([]string(nil), note.Tags...),
+			Archived: note.Archived,
+			ModTime:  note.ModTime.Format(time.RFC3339),
+		}
+		for _, task := range tasks {
+			group.Tasks = append(group.Tasks, webTask{
+				Text: task.Text,
+				Line: task.Line,
+			})
+		}
+		groups = append(groups, group)
+	}
+
+	if len(groups) == 0 {
+		fmt.Println("no open tasks found")
+		return nil
+	}
+
+	for _, group := range groups {
+		fmt.Printf("%s\t%s\t%s\t%s\n", group.ID, group.ModTime, group.Title, formatTags(group.Tags))
+		for _, task := range group.Tasks {
+			fmt.Printf("\t[ ] %s\n", task.Text)
+		}
 	}
 
 	return nil
@@ -628,6 +714,7 @@ func serveNotes(args []string) error {
 func newServeMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveIndexPage)
+	mux.HandleFunc("/tasks", serveTasksPage)
 	mux.HandleFunc("/new", serveCreateNotePage)
 	mux.HandleFunc("/notes", serveCreateNote)
 	mux.HandleFunc("/notes/", serveNotePage)
@@ -653,9 +740,51 @@ func serveIndexPage(w http.ResponseWriter, r *http.Request) {
 		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
 		AvailableTags:   snapshot.Tags,
 		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		FilterPage:      "/",
+		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 	}
 
 	data.Notes = filterSnapshotNotes(snapshot.Notes, data.ActiveTag, data.IncludeArchived)
+	renderNotebookPage(w, data)
+}
+
+func serveTasksPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/tasks" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snapshot, err := buildNotebookSnapshot()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	activeTag := strings.TrimSpace(r.URL.Query().Get("tag"))
+	includeArchived := queryIncludesArchived(r.URL.Query())
+	taskGroups := filterTaskGroups(snapshot.TaskGroups, activeTag, includeArchived)
+	taskCount := 0
+	for _, group := range taskGroups {
+		taskCount += len(group.Tasks)
+	}
+
+	data := notebookPageData{
+		Title:           "Open Tasks",
+		HeaderTitle:     "Open Tasks",
+		HeaderSubtitle:  fmt.Sprintf("%d open %s", taskCount, pluralize(taskCount, "task", "tasks")),
+		ActiveTag:       activeTag,
+		AvailableTags:   snapshot.Tags,
+		IncludeArchived: includeArchived,
+		FilterPage:      "/tasks",
+		ShowTasks:       true,
+		TasksPageURL:    tasksURL(activeTag, includeArchived),
+		Notes:           filterSnapshotNotes(snapshot.Notes, activeTag, includeArchived),
+		TaskGroups:      taskGroups,
+	}
 	renderNotebookPage(w, data)
 }
 
@@ -682,6 +811,8 @@ func serveCreateNotePage(w http.ResponseWriter, r *http.Request) {
 		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
 		AvailableTags:   snapshot.Tags,
 		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		FilterPage:      "/",
+		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 		NoteForm: &webNoteForm{
 			ActionURL:   "/notes",
@@ -782,6 +913,8 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
 		AvailableTags:   snapshot.Tags,
 		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		FilterPage:      "/",
+		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 		CurrentNote:     &detail,
 	}
@@ -826,6 +959,8 @@ func serveEditNotePage(w http.ResponseWriter, r *http.Request, id string) {
 		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
 		AvailableTags:   snapshot.Tags,
 		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		FilterPage:      "/",
+		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 		NoteForm: &webNoteForm{
 			Title:       content.Title,
@@ -881,6 +1016,8 @@ func renderWebFormError(w http.ResponseWriter, r *http.Request, status int, head
 		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
 		AvailableTags:   snapshot.Tags,
 		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		FilterPage:      "/",
+		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
 		NoteForm:        &form,
 	}
@@ -1599,6 +1736,23 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 		snapshot.Notes = append(snapshot.Notes, summary)
 		snapshot.NotesByID[note.ID] = summary
 		snapshot.RenderedNotes[note.ID] = detail
+		if tasks := openTasksFromBody(content.Body); len(tasks) > 0 {
+			group := webTaskGroup{
+				ID:        note.ID,
+				Title:     note.Title,
+				Tags:      append([]string(nil), note.Tags...),
+				Archived:  note.Archived,
+				ModTime:   note.ModTime.Format(time.RFC3339),
+				DetailURL: noteURL(note.ID),
+			}
+			for _, task := range tasks {
+				group.Tasks = append(group.Tasks, webTask{
+					Text: task.Text,
+					Line: task.Line,
+				})
+			}
+			snapshot.TaskGroups = append(snapshot.TaskGroups, group)
+		}
 	}
 
 	sort.Slice(snapshot.Notes, func(i, j int) bool {
@@ -1606,6 +1760,12 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 			return snapshot.Notes[i].ID < snapshot.Notes[j].ID
 		}
 		return snapshot.Notes[i].ModTime > snapshot.Notes[j].ModTime
+	})
+	sort.Slice(snapshot.TaskGroups, func(i, j int) bool {
+		if snapshot.TaskGroups[i].ModTime == snapshot.TaskGroups[j].ModTime {
+			return snapshot.TaskGroups[i].ID < snapshot.TaskGroups[j].ID
+		}
+		return snapshot.TaskGroups[i].ModTime > snapshot.TaskGroups[j].ModTime
 	})
 	return snapshot, nil
 }
@@ -1660,6 +1820,20 @@ func filterSnapshotNotes(notes []webNoteSummary, tag string, includeArchived boo
 	return filtered
 }
 
+func filterTaskGroups(groups []webTaskGroup, tag string, includeArchived bool) []webTaskGroup {
+	var filtered []webTaskGroup
+	for _, group := range groups {
+		if tag != "" && !hasAllTags(group.Tags, []string{tag}) {
+			continue
+		}
+		if !includeArchived && group.Archived {
+			continue
+		}
+		filtered = append(filtered, group)
+	}
+	return filtered
+}
+
 func queryIncludesArchived(values url.Values) bool {
 	includeArchived := strings.TrimSpace(values.Get("archived"))
 	return includeArchived == "1" || strings.EqualFold(includeArchived, "true")
@@ -1673,20 +1847,34 @@ func noteEditURL(id string) string {
 	return noteURL(id) + "/edit"
 }
 
-func tagURL(tag string, includeArchived bool) string {
+func tagURL(page, tag string, includeArchived bool) string {
 	values := url.Values{}
 	values.Set("tag", tag)
 	if includeArchived {
 		values.Set("archived", "1")
 	}
-	return "/?" + values.Encode()
+	return page + "?" + values.Encode()
 }
 
-func clearTagURL(includeArchived bool) string {
+func clearTagURL(page string, includeArchived bool) string {
 	if !includeArchived {
-		return "/"
+		return page
 	}
-	return "/?archived=1"
+	return page + "?archived=1"
+}
+
+func tasksURL(tag string, includeArchived bool) string {
+	values := url.Values{}
+	if tag != "" {
+		values.Set("tag", tag)
+	}
+	if includeArchived {
+		values.Set("archived", "1")
+	}
+	if encoded := values.Encode(); encoded != "" {
+		return "/tasks?" + encoded
+	}
+	return "/tasks"
 }
 
 func notebookSubtitle(count int) string {
@@ -2012,7 +2200,7 @@ func parseFilterOptions(args []string) (noteOptions, error) {
 
 func validateMutationOptions(opts noteOptions) error {
 	if opts.IncludeArchived || opts.ArchivedOnly {
-		return errors.New("--include-archived and --archived-only are only valid for list/search")
+		return errors.New("--include-archived and --archived-only are only valid for list/search/tasks")
 	}
 	if opts.Template != "" {
 		return errors.New("--template is only valid for create/template")
@@ -2022,7 +2210,7 @@ func validateMutationOptions(opts noteOptions) error {
 
 func validateCreateOptions(opts noteOptions) error {
 	if opts.IncludeArchived || opts.ArchivedOnly {
-		return errors.New("--include-archived and --archived-only are only valid for list/search")
+		return errors.New("--include-archived and --archived-only are only valid for list/search/tasks")
 	}
 	return nil
 }
@@ -2515,7 +2703,7 @@ func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML
 				b.WriteString("<ul>")
 				inList = true
 			}
-			b.WriteString("<li>" + renderInlineMarkdown(strings.TrimSpace(trimmed[2:]), existing) + "</li>")
+			b.WriteString("<li>" + renderListItemMarkdown(strings.TrimSpace(trimmed[2:]), existing) + "</li>")
 			continue
 		}
 
@@ -2530,6 +2718,19 @@ func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML
 	return template.HTML(b.String())
 }
 
+func renderListItemMarkdown(text string, existing map[string]struct{}) string {
+	task, ok := parseTaskLine(text)
+	if !ok {
+		return renderInlineMarkdown(text, existing)
+	}
+
+	checked := ""
+	if !task.Open {
+		checked = " checked"
+	}
+	return `<label class="task-item"><input type="checkbox" disabled` + checked + `><span>` + renderInlineMarkdown(task.Text, existing) + `</span></label>`
+}
+
 func renderInlineMarkdown(text string, existing map[string]struct{}) string {
 	text = html.EscapeString(text)
 	text = renderWikiLinks(text, existing)
@@ -2537,6 +2738,43 @@ func renderInlineMarkdown(text string, existing map[string]struct{}) string {
 	text = boldPattern.ReplaceAllString(text, "<strong>$1</strong>")
 	text = italicPattern.ReplaceAllString(text, "<em>$1</em>")
 	return text
+}
+
+func openTasksFromBody(body string) []noteTask {
+	lines := strings.Split(body, "\n")
+	var tasks []noteTask
+	for i, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if !(strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ")) {
+			continue
+		}
+		task, ok := parseTaskLine(strings.TrimSpace(trimmed[2:]))
+		if !ok || !task.Open {
+			continue
+		}
+		task.Line = i + 1
+		tasks = append(tasks, task)
+	}
+	return tasks
+}
+
+func parseTaskLine(text string) (noteTask, bool) {
+	if len(text) < 4 || text[0] != '[' || text[2] != ']' {
+		return noteTask{}, false
+	}
+	if text[3] != ' ' {
+		return noteTask{}, false
+	}
+
+	state := text[1]
+	switch state {
+	case ' ':
+		return noteTask{Text: strings.TrimSpace(text[4:]), Open: true}, true
+	case 'x', 'X':
+		return noteTask{Text: strings.TrimSpace(text[4:]), Open: false}, true
+	default:
+		return noteTask{}, false
+	}
 }
 
 func renderWikiLinks(text string, existing map[string]struct{}) string {
@@ -2613,6 +2851,12 @@ func notebookPageTemplate() *template.Template {
     .field textarea { min-height:320px; resize:vertical; font-family: "SFMono-Regular", Consolas, monospace; font-size:0.95rem; line-height:1.5; }
     .field .hint { color:var(--muted); font-size:0.85rem; }
     .checkbox { display:flex; align-items:center; gap:0.55rem; }
+    .task-groups { display:grid; gap:1rem; margin-top:1rem; }
+    .task-group { border:1px solid var(--line); border-radius:16px; padding:1rem 1rem 0.9rem; background:#fff; }
+    .task-group h2 { margin:0 0 0.35rem; font-size:1.1rem; }
+    .task-list { display:grid; gap:0.65rem; margin-top:0.85rem; }
+    .task-item { display:flex; align-items:flex-start; gap:0.6rem; }
+    .task-item input { margin-top:0.2rem; }
     .form-actions { display:flex; gap:0.75rem; flex-wrap:wrap; }
     @media (max-width: 880px) {
       .layout { grid-template-columns: 1fr; }
@@ -2629,17 +2873,18 @@ func notebookPageTemplate() *template.Template {
         <h1>{{.HeaderTitle}}</h1>
         <div class="subtitle">{{.HeaderSubtitle}}</div>
         <div class="filters">
-          <a class="filter-link {{if eq .ActiveTag ""}}active{{end}}" href="{{clearTagURL .IncludeArchived}}">All</a>
+          <a class="filter-link {{if eq .ActiveTag ""}}active{{end}}" href="{{clearTagURL .FilterPage .IncludeArchived}}">All</a>
           {{range .AvailableTags}}
-            <a class="filter-link {{if eq $.ActiveTag .}}active{{end}}" href="{{tagURL . $.IncludeArchived}}">#{{.}}</a>
+            <a class="filter-link {{if eq $.ActiveTag .}}active{{end}}" href="{{tagURL $.FilterPage . $.IncludeArchived}}">#{{.}}</a>
           {{end}}
         </div>
         <div class="toolbar">
           <a class="button secondary" href="/new">New note</a>
+          <a class="button secondary" href="{{.TasksPageURL}}">Open tasks</a>
           {{if .IncludeArchived}}
-            <a class="toggle" href="{{if .ActiveTag}}{{tagURL .ActiveTag false}}{{else}}/{{end}}">Hide archived</a>
+            <a class="toggle" href="{{if .ActiveTag}}{{tagURL .FilterPage .ActiveTag false}}{{else}}{{.FilterPage}}{{end}}">Hide archived</a>
           {{else}}
-            <a class="toggle" href="{{if .ActiveTag}}{{tagURL .ActiveTag true}}{{else}}/?archived=1{{end}}">Show archived</a>
+            <a class="toggle" href="{{if .ActiveTag}}{{tagURL .FilterPage .ActiveTag true}}{{else}}{{clearTagURL .FilterPage true}}{{end}}">Show archived</a>
           {{end}}
         </div>
         <div class="note-list">
@@ -2732,10 +2977,36 @@ func notebookPageTemplate() *template.Template {
               <div class="empty">No backlinks yet.</div>
             {{end}}
           </div>
+        {{else if .ShowTasks}}
+          <div class="eyebrow">Notebook</div>
+          <h1>{{.HeaderTitle}}</h1>
+          <p>{{.HeaderSubtitle}}</p>
+          {{if .TaskGroups}}
+            <div class="task-groups">
+              {{range .TaskGroups}}
+                <section class="task-group">
+                  <h2><a href="{{.DetailURL}}">{{.Title}}</a></h2>
+                  <div class="meta">{{.ID}} · {{.ModTime}}{{if .Archived}} · <span class="archived">archived</span>{{end}}</div>
+                  {{if .Tags}}
+                    <div class="meta" style="margin-top:0.5rem;">
+                      {{range .Tags}}<span class="tag">#{{.}}</span>{{end}}
+                    </div>
+                  {{end}}
+                  <div class="task-list">
+                    {{range .Tasks}}
+                      <label class="task-item"><input type="checkbox" disabled><span>{{.Text}}</span></label>
+                    {{end}}
+                  </div>
+                </section>
+              {{end}}
+            </div>
+          {{else}}
+            <div class="empty">No open tasks match this filter.</div>
+          {{end}}
         {{else}}
           <div class="eyebrow">Notebook</div>
           <h1>Rendered notes</h1>
-          <p>Select a note from the left to browse rendered Markdown, follow wiki links, inspect backlinks, and catch broken references.</p>
+          <p>Select a note from the left to browse rendered Markdown, follow wiki links, inspect backlinks, catch broken references, or open the notebook-wide task list.</p>
           <div class="actions">
             <a class="button" href="/new">Create a note</a>
           </div>
@@ -2861,6 +3132,7 @@ func printUsage() {
 	fmt.Println("  rename <old-id> <new-id>    Rename a note file and rewrite matching note links")
 	fmt.Println("  list [--tag <tag>]... [--include-archived|--archived-only]   List saved notes")
 	fmt.Println("  search <query> [--tag <tag>]... [--include-archived|--archived-only] Search note titles and bodies")
+	fmt.Println("  tasks [--tag <tag>]... [--include-archived|--archived-only]  List open Markdown checkbox tasks")
 	fmt.Println("  today                     Create or open today's daily note")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  links <id>                List outgoing [[note-id]] links from a note")

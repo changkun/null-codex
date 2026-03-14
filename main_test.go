@@ -244,7 +244,7 @@ func TestCreateNoteRejectsArchiveFilterFlags(t *testing.T) {
 	withTempDir(t)
 
 	err := createNote([]string{"Daily Log", "--include-archived"})
-	if err == nil || err.Error() != "--include-archived and --archived-only are only valid for list/search" {
+	if err == nil || err.Error() != "--include-archived and --archived-only are only valid for list/search/tasks" {
 		t.Fatalf("expected filter flag error, got %v", err)
 	}
 }
@@ -849,6 +849,120 @@ func TestSearchNotesSnippetUsesParsedBodyInsteadOfMetadata(t *testing.T) {
 	}
 	if strings.Contains(output, "Archived: true") {
 		t.Fatalf("expected metadata to be excluded from snippet, got %q", output)
+	}
+}
+
+func TestListTasksGroupsOpenCheckboxesByNote(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("project"), []byte("# Project\nTags: work\n\n## Tasks\n- [ ] Ship release\n- [x] Closed item\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("review"), []byte("# Review\nTags: work, review\nArchived: true\n\n- [ ] Write recap\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listTasks([]string{"--include-archived", "--tag", "work"}); err != nil {
+			t.Fatalf("listTasks returned error: %v", err)
+		}
+	})
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("expected grouped task output, got %d lines in %q", len(lines), output)
+	}
+	if !strings.Contains(lines[0], "review") || !strings.Contains(lines[0], "Review") {
+		t.Fatalf("expected newest matching note first, got %q", lines[0])
+	}
+	if lines[1] != "\t[ ] Write recap" {
+		t.Fatalf("unexpected task line: %q", lines[1])
+	}
+	if !strings.Contains(lines[2], "project") || !strings.Contains(lines[2], "Project") {
+		t.Fatalf("expected second task group, got %q", lines[2])
+	}
+	if lines[3] != "\t[ ] Ship release" {
+		t.Fatalf("unexpected open task line: %q", lines[3])
+	}
+	if strings.Contains(output, "Closed item") {
+		t.Fatalf("expected completed tasks to be hidden, got %q", output)
+	}
+}
+
+func TestListTasksAppliesArchivedFilterByDefault(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("active"), []byte("# Active\n\n- [ ] Visible task\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("archived"), []byte("# Archived\nArchived: true\n\n- [ ] Hidden task\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listTasks(nil); err != nil {
+			t.Fatalf("listTasks returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "Visible task") {
+		t.Fatalf("expected active task in output, got %q", output)
+	}
+	if strings.Contains(output, "Hidden task") {
+		t.Fatalf("expected archived task to be hidden, got %q", output)
+	}
+}
+
+func TestListTasksPrintsNoOpenTasksMessage(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("done"), []byte("# Done\n\n- [x] Finished\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listTasks(nil); err != nil {
+			t.Fatalf("listTasks returned error: %v", err)
+		}
+	})
+
+	if output != "no open tasks found\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestRunIncludesTasksCommand(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\n- [ ] Follow up\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := run([]string{"tasks"}); err != nil {
+			t.Fatalf("run returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "daily-log") || !strings.Contains(output, "Follow up") {
+		t.Fatalf("expected tasks output, got %q", output)
 	}
 }
 
@@ -1510,6 +1624,17 @@ func TestRenderMarkdownHTMLLinksExistingAndBrokenNotes(t *testing.T) {
 	}
 }
 
+func TestRenderMarkdownHTMLRendersCheckboxItems(t *testing.T) {
+	got := string(renderMarkdownHTML("- [ ] Open\n- [x] Done", nil))
+
+	if !strings.Contains(got, `<label class="task-item"><input type="checkbox" disabled><span>Open</span></label>`) {
+		t.Fatalf("expected open checkbox item, got %q", got)
+	}
+	if !strings.Contains(got, `<label class="task-item"><input type="checkbox" disabled checked><span>Done</span></label>`) {
+		t.Fatalf("expected closed checkbox item, got %q", got)
+	}
+}
+
 func TestParseServeOptions(t *testing.T) {
 	opts, err := parseServeOptions([]string{"--addr", ":9999"})
 	if err != nil {
@@ -1827,6 +1952,71 @@ func TestServeCreateNotePageRendersForm(t *testing.T) {
 	}
 	if !strings.Contains(body, "Create note") {
 		t.Fatalf("expected create action text, got %q", body)
+	}
+}
+
+func TestServeTasksPageRendersGroupedOpenTasks(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\n\n- [ ] Alpha task\n- [x] Closed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("beta"), []byte("# Beta\nTags: home\nArchived: true\n\n- [ ] Archived task\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/tasks?tag=work", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Open Tasks") {
+		t.Fatalf("expected tasks heading, got %q", body)
+	}
+	if !strings.Contains(body, "Alpha task") {
+		t.Fatalf("expected open task in body, got %q", body)
+	}
+	if strings.Contains(body, "Closed") {
+		t.Fatalf("expected completed task to be hidden, got %q", body)
+	}
+	if strings.Contains(body, "Archived task") {
+		t.Fatalf("expected archived task filtered by default, got %q", body)
+	}
+	if !strings.Contains(body, `href="/tasks?tag=work"`) {
+		t.Fatalf("expected task-page filter links to stay on /tasks, got %q", body)
+	}
+}
+
+func TestServeTasksPageShowsEmptyState(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\n\n- [x] Done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/tasks", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "No open tasks match this filter.") {
+		t.Fatalf("expected empty tasks state, got %q", rec.Body.String())
 	}
 }
 
