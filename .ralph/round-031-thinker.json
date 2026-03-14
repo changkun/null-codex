@@ -1,0 +1,3 @@
+{
+  "result": "Goal: Refactor the single-file app in [main.go](/home/changkun/null-codex/main.go) into focused packages (`notes`, `tasks`, `web`, and `sync`) while preserving behavior with targeted tests, so the codebase becomes maintainable enough for the next round of features."
+}

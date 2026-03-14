@@ -8,7 +8,6 @@ import (
 	"html/template"
 	"io"
 	"io/fs"
-	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -22,6 +21,11 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	notespkg "null-codex/pkg/notes"
+	syncpkg "null-codex/sync"
+	taskspkg "null-codex/tasks"
+	webpkg "null-codex/web"
 )
 
 const (
@@ -1884,52 +1888,14 @@ func syncNotes(args []string) error {
 		return errors.New("sync does not take any arguments")
 	}
 
-	if _, err := os.Stat(notesDir); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("%s is not a Git repository; initialize it with git and configure a remote first", notesDir)
-		}
-		return err
-	}
-
-	if _, err := runGit("rev-parse", "--is-inside-work-tree"); err != nil {
-		return fmt.Errorf("%s is not a Git repository; initialize it with git and configure a remote first", notesDir)
-	}
-
-	upstream, err := runGit("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	result, err := syncpkg.Notebook(notesDir, now)
 	if err != nil {
-		return errors.New("notes Git remote is not configured; set an upstream branch for notes/ before syncing")
-	}
-	upstream = strings.TrimSpace(upstream)
-	if upstream == "" {
-		return errors.New("notes Git remote is not configured; set an upstream branch for notes/ before syncing")
-	}
-
-	if _, err := runGit("add", "--all", "."); err != nil {
 		return err
 	}
-
-	committed := false
-	if hasChanges, err := gitHasStagedChanges(); err != nil {
-		return err
-	} else if hasChanges {
-		message := fmt.Sprintf("sync notebook %s", now().UTC().Format(time.RFC3339))
-		if _, err := runGit("commit", "-m", message); err != nil {
-			return err
-		}
-		committed = true
-	}
-
-	if _, err := runGit("pull", "--rebase"); err != nil {
-		return err
-	}
-	if _, err := runGit("push"); err != nil {
-		return err
-	}
-
-	if committed {
-		fmt.Printf("synced notes with %s\n", upstream)
+	if result.Committed {
+		fmt.Printf("synced notes with %s\n", result.Upstream)
 	} else {
-		fmt.Printf("synced notes with %s (no local changes)\n", upstream)
+		fmt.Printf("synced notes with %s (no local changes)\n", result.Upstream)
 	}
 	return nil
 }
@@ -2198,11 +2164,7 @@ func nextNoteID(title string) (string, error) {
 }
 
 func readTitle(path string) (string, error) {
-	content, err := readNoteContent(path)
-	if err != nil {
-		return "", err
-	}
-	return content.Title, nil
+	return notespkg.ReadTitle(path)
 }
 
 func loadOrCreateInboxNote() (noteContent, bool, error) {
@@ -2221,104 +2183,25 @@ func loadOrCreateInboxNote() (noteContent, bool, error) {
 }
 
 func readNoteContent(path string) (noteContent, error) {
-	data, err := os.ReadFile(path)
+	content, err := notespkg.ReadContent(path)
 	if err != nil {
 		return noteContent{}, err
 	}
-
-	return parseNoteContent(path, string(data)), nil
+	return fromNotesContent(content), nil
 }
 
 func parseNoteContent(path, data string) noteContent {
-	lines := strings.Split(data, "\n")
-	content := noteContent{
-		Title:       strings.TrimSuffix(filepath.Base(path), ".md"),
-		Attachments: nil,
-		BodyLine:    1,
-	}
-
-	bodyStart := 0
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "# ") {
-			content.Title = strings.TrimSpace(strings.TrimPrefix(trimmed, "# "))
-			bodyStart = i + 1
-		} else {
-			content.Title = trimmed
-			bodyStart = i + 1
-		}
-		break
-	}
-
-	if bodyStart < len(lines) {
-		for bodyStart < len(lines) {
-			line := strings.TrimSpace(lines[bodyStart])
-			lower := strings.ToLower(line)
-			switch {
-			case strings.HasPrefix(lower, "tags:"):
-				content.Tags = normalizeTags(strings.Split(strings.TrimSpace(line[5:]), ","))
-				bodyStart++
-			case strings.HasPrefix(lower, "archived:"):
-				content.Archived = strings.EqualFold(strings.TrimSpace(line[9:]), "true")
-				bodyStart++
-			case strings.HasPrefix(lower, "attachment:"):
-				if attachment, ok := parseAttachmentLine(line); ok {
-					content.Attachments = append(content.Attachments, attachment)
-				}
-				bodyStart++
-			default:
-				goto body
-			}
-		}
-	}
-
-body:
-	for bodyStart < len(lines) && strings.TrimSpace(lines[bodyStart]) == "" {
-		bodyStart++
-	}
-	content.BodyLine = bodyStart + 1
-	content.Body = strings.TrimRight(strings.Join(lines[bodyStart:], "\n"), "\n")
-
-	return content
+	return fromNotesContent(notespkg.ParseContent(path, data))
 }
 
 func parseAttachmentLine(line string) (noteAttachment, bool) {
-	value := strings.TrimSpace(line[len("Attachment:"):])
-	parts := strings.Split(value, "|")
-	if len(parts) != 3 {
-		return noteAttachment{}, false
-	}
-	attachment := noteAttachment{
-		StoredName: strings.TrimSpace(parts[0]),
-		Name:       strings.TrimSpace(parts[1]),
-		MediaType:  strings.TrimSpace(parts[2]),
-	}
-	if attachment.StoredName == "" || attachment.Name == "" || attachment.MediaType == "" {
-		return noteAttachment{}, false
-	}
-	return attachment, true
+	attachment, ok := notespkg.ParseAttachmentLine(line)
+	return fromNotesAttachment(attachment), ok
 }
 
 func addNoteAttachments(id string, existing []noteAttachment, body string, paths []string, embed bool) ([]noteAttachment, string, error) {
-	attachments := append([]noteAttachment(nil), existing...)
-	if err := os.MkdirAll(noteAttachmentsDir(id), 0o755); err != nil {
-		return nil, "", err
-	}
-
-	for _, sourcePath := range paths {
-		attachment, err := copyAttachmentFile(id, strings.TrimSpace(sourcePath))
-		if err != nil {
-			return nil, "", err
-		}
-		attachments = append(attachments, attachment)
-		if embed && attachment.IsImage() {
-			body = appendEmbeddedAttachment(body, id, attachment)
-		}
-	}
-	return attachments, body, nil
+	attachments, updatedBody, err := notespkg.AddAttachments(id, toNotesAttachments(existing), body, paths, embed)
+	return fromNotesAttachments(attachments), updatedBody, err
 }
 
 func copyAttachmentFile(id, sourcePath string) (noteAttachment, error) {
@@ -2377,44 +2260,19 @@ func uniqueAttachmentStoredName(id, originalName string) string {
 }
 
 func sanitizeAttachmentName(name string) string {
-	name = strings.TrimSpace(filepath.Base(name))
-	name = strings.ReplaceAll(name, " ", "-")
-	name = strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z':
-			return r
-		case r >= 'A' && r <= 'Z':
-			return r
-		case r >= '0' && r <= '9':
-			return r
-		case strings.ContainsRune("._-", r):
-			return r
-		default:
-			return '-'
-		}
-	}, name)
-	name = strings.Trim(name, ".-")
-	return name
+	return notespkg.SanitizeAttachmentName(name)
 }
 
 func detectAttachmentMediaType(name string) string {
-	if mediaType := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); mediaType != "" {
-		return mediaType
-	}
-	return "application/octet-stream"
+	return notespkg.DetectAttachmentMediaType(name)
 }
 
 func appendEmbeddedAttachment(body, id string, attachment noteAttachment) string {
-	embed := fmt.Sprintf("![%s](%s)", attachment.Name, attachmentMarkdownPath(id, attachment.StoredName))
-	body = strings.TrimRight(body, "\n")
-	if body == "" {
-		return embed
-	}
-	return body + "\n\n" + embed
+	return notespkg.AppendEmbeddedAttachment(body, id, toNotesAttachment(attachment))
 }
 
 func attachmentMarkdownPath(id, storedName string) string {
-	return filepath.ToSlash(filepath.Join(noteAttachmentDir, id, storedName))
+	return notespkg.AttachmentMarkdownPath(id, storedName)
 }
 
 func (a noteAttachment) IsImage() bool {
@@ -2422,44 +2280,7 @@ func (a noteAttachment) IsImage() bool {
 }
 
 func materializeMultipartFiles(files []*multipart.FileHeader) ([]string, func(), error) {
-	tempDir, err := os.MkdirTemp("", "note-attachments-*")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cleanup := func() {
-		_ = os.RemoveAll(tempDir)
-	}
-	var paths []string
-	for _, fileHeader := range files {
-		source, err := fileHeader.Open()
-		if err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-
-		name := sanitizeAttachmentName(fileHeader.Filename)
-		if name == "" {
-			name = "attachment"
-		}
-		targetPath := filepath.Join(tempDir, uniqueLocalAttachmentName(tempDir, name))
-		target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-		if err != nil {
-			source.Close()
-			cleanup()
-			return nil, nil, err
-		}
-		if _, err := io.Copy(target, source); err != nil {
-			target.Close()
-			source.Close()
-			cleanup()
-			return nil, nil, err
-		}
-		target.Close()
-		source.Close()
-		paths = append(paths, targetPath)
-	}
-	return paths, cleanup, nil
+	return notespkg.MaterializeMultipartFiles(files)
 }
 
 func uniqueLocalAttachmentName(dir, name string) string {
@@ -2475,49 +2296,12 @@ func uniqueLocalAttachmentName(dir, name string) string {
 }
 
 func loadNotes() ([]noteMeta, error) {
-	entries, err := os.ReadDir(notesDir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var notes []noteMeta
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			return nil, err
-		}
-
-		id := strings.TrimSuffix(entry.Name(), ".md")
-		content, err := readNoteContent(notePath(id))
-		if err != nil {
-			return nil, err
-		}
-
-		notes = append(notes, noteMeta{
-			ID:       id,
-			Title:    content.Title,
-			Tags:     content.Tags,
-			Archived: content.Archived,
-			ModTime:  info.ModTime(),
-		})
-	}
-
-	sort.Slice(notes, func(i, j int) bool {
-		return notes[i].ModTime.After(notes[j].ModTime)
-	})
-
-	return notes, nil
+	loaded, err := notespkg.Load()
+	return fromNotesMetaSlice(loaded), err
 }
 
 func notePath(id string) string {
-	return filepath.Join(notesDir, id+".md")
+	return notespkg.Path(id)
 }
 
 func attachmentsRoot() string {
@@ -2525,69 +2309,27 @@ func attachmentsRoot() string {
 }
 
 func noteAttachmentsDir(id string) string {
-	return filepath.Join(attachmentsRoot(), id)
+	return notespkg.AttachmentsDir(id)
 }
 
 func noteAttachmentPath(id, storedName string) string {
-	return filepath.Join(noteAttachmentsDir(id), storedName)
+	return notespkg.AttachmentPath(id, storedName)
 }
 
 func customTemplateDir() string {
-	return filepath.Join(notesDir, noteTemplateDir)
+	return notespkg.CustomTemplateDir()
 }
 
 func customTemplatePath(name string) (string, error) {
-	if name == "" {
-		return "", errors.New("template name cannot be empty")
-	}
-	if strings.ContainsAny(name, `/\`) {
-		return "", fmt.Errorf("invalid template name %q", name)
-	}
-	if name == "." || name == ".." {
-		return "", fmt.Errorf("invalid template name %q", name)
-	}
-	return filepath.Join(customTemplateDir(), name+".md"), nil
+	return notespkg.CustomTemplatePath(name)
 }
 
 func formatNote(note noteContent) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "# %s\n", note.Title)
-	if len(note.Tags) > 0 {
-		fmt.Fprintf(&b, "Tags: %s\n", strings.Join(note.Tags, ", "))
-	}
-	if note.Archived {
-		b.WriteString("Archived: true\n")
-	}
-	for _, attachment := range note.Attachments {
-		fmt.Fprintf(&b, "Attachment: %s | %s | %s\n", attachment.StoredName, attachment.Name, attachment.MediaType)
-	}
-	b.WriteString("\n")
-	if note.Body != "" {
-		b.WriteString(note.Body)
-		b.WriteString("\n")
-	}
-	return b.String()
+	return notespkg.Format(toNotesContent(note))
 }
 
 func extractNoteLinks(body string) []string {
-	matches := noteLinkPattern.FindAllStringSubmatch(body, -1)
-	seen := make(map[string]struct{})
-	var links []string
-	for _, match := range matches {
-		if len(match) < 2 {
-			continue
-		}
-		id := strings.TrimSpace(match[1])
-		if id == "" {
-			continue
-		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		links = append(links, id)
-	}
-	return links
+	return notespkg.ExtractLinks(body)
 }
 
 func renameLinkedReferences(oldID, newID string) error {
@@ -2631,127 +2373,25 @@ func renameLinkedReferences(oldID, newID string) error {
 }
 
 func rewriteNoteLinks(content, oldID, newID string) string {
-	return noteLinkPattern.ReplaceAllStringFunc(content, func(match string) string {
-		parts := noteLinkPattern.FindStringSubmatch(match)
-		if len(parts) < 2 {
-			return match
-		}
-
-		target := parts[1]
-		if strings.TrimSpace(target) != oldID {
-			return match
-		}
-
-		leading := len(target) - len(strings.TrimLeftFunc(target, unicode.IsSpace))
-		trailing := len(target) - len(strings.TrimRightFunc(target, unicode.IsSpace))
-		return "[[" + target[:leading] + newID + target[len(target)-trailing:] + "]]"
-	})
+	return notespkg.RewriteLinks(content, oldID, newID)
 }
 
 func findBacklinks(targetID string) ([]string, error) {
-	notes, err := loadNotes()
-	if err != nil {
-		return nil, err
-	}
-
-	var backlinks []string
-	for _, note := range notes {
-		if note.ID == targetID {
-			continue
-		}
-
-		content, err := readNoteContent(notePath(note.ID))
-		if err != nil {
-			return nil, err
-		}
-
-		if containsLink(extractNoteLinks(content.Body), targetID) {
-			backlinks = append(backlinks, note.ID)
-		}
-	}
-
-	sort.Strings(backlinks)
-	return backlinks, nil
+	return notespkg.FindBacklinks(targetID)
 }
 
 func collectNotebookLinks(notes []noteMeta) (map[string]struct{}, []noteEdge, error) {
-	noteSet := make(map[string]struct{}, len(notes))
-	for _, note := range notes {
-		noteSet[note.ID] = struct{}{}
-	}
-
-	var edges []noteEdge
-	for _, note := range notes {
-		content, err := readNoteContent(notePath(note.ID))
-		if err != nil {
-			return nil, nil, err
-		}
-
-		for _, target := range extractNoteLinks(content.Body) {
-			edges = append(edges, noteEdge{
-				Source: note.ID,
-				Target: target,
-			})
-		}
-	}
-
-	sort.Slice(edges, func(i, j int) bool {
-		if edges[i].Source == edges[j].Source {
-			return edges[i].Target < edges[j].Target
-		}
-		return edges[i].Source < edges[j].Source
-	})
-
-	return noteSet, edges, nil
+	noteSet, edges, err := notespkg.CollectNotebookLinks(toNotesMetaSlice(notes))
+	return noteSet, fromNotesEdges(edges), err
 }
 
 func readExistingNote(id string) ([]byte, error) {
-	data, err := os.ReadFile(notePath(id))
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("note %q not found", id)
-		}
-		return nil, err
-	}
-	return data, nil
+	return notespkg.ReadExisting(id)
 }
 
 func inspectNotebook(notes []noteMeta) ([]brokenLink, []string, error) {
-	noteSet, edges, err := collectNotebookLinks(notes)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	backlinkCounts := make(map[string]int, len(notes))
-	var brokenLinks []brokenLink
-	for _, edge := range edges {
-		if edge.Source != edge.Target {
-			if _, ok := noteSet[edge.Target]; ok {
-				backlinkCounts[edge.Target]++
-			} else {
-				brokenLinks = append(brokenLinks, brokenLink{
-					Source: edge.Source,
-					Target: edge.Target,
-				})
-			}
-		}
-	}
-
-	var orphanedNotes []string
-	for _, note := range notes {
-		if backlinkCounts[note.ID] == 0 {
-			orphanedNotes = append(orphanedNotes, note.ID)
-		}
-	}
-
-	sort.Slice(brokenLinks, func(i, j int) bool {
-		if brokenLinks[i].Source == brokenLinks[j].Source {
-			return brokenLinks[i].Target < brokenLinks[j].Target
-		}
-		return brokenLinks[i].Source < brokenLinks[j].Source
-	})
-	sort.Strings(orphanedNotes)
-	return brokenLinks, orphanedNotes, nil
+	brokenLinks, orphanedNotes, err := notespkg.InspectNotebook(toNotesMetaSlice(notes))
+	return fromBrokenLinks(brokenLinks), orphanedNotes, err
 }
 
 func buildNotebookSnapshot() (notebookSnapshot, error) {
@@ -2927,17 +2567,14 @@ func findNoteMeta(notes []noteMeta, id string) noteMeta {
 }
 
 func parseWebFilterOptions(values url.Values) webFilterOptions {
-	filter := webFilterOptions{
-		Query:        strings.TrimSpace(values.Get("q")),
-		ArchivedMode: queryArchivedMode(values),
-		TaskView:     queryTaskView(values),
+	filter := webpkg.ParseFilterOptions(values, normalizeTags)
+	return webFilterOptions{
+		Query:        filter.Query,
+		Tags:         filter.Tags,
+		TagsInput:    filter.TagsInput,
+		ArchivedMode: filter.ArchivedMode,
+		TaskView:     filter.TaskView,
 	}
-	filter.Tags = parseWebTags(values.Get("tags"))
-	for _, tag := range values["tag"] {
-		filter.Tags = normalizeTags(append(filter.Tags, tag))
-	}
-	filter.TagsInput = strings.Join(filter.Tags, ", ")
-	return filter
 }
 
 func filterSnapshotNotes(notes []webNoteSummary, filter webFilterOptions) []webNoteSummary {
@@ -4120,77 +3757,11 @@ func diffOperations(a, b []string) []diffOp {
 }
 
 func renderMarkdownHTML(noteID string, content noteContent, existing map[string]struct{}, tasks *taskRenderOptions) template.HTML {
-	lines := strings.Split(content.Body, "\n")
-	var b strings.Builder
-	inList := false
-	inCode := false
-
-	closeList := func() {
-		if inList {
-			b.WriteString("</ul>")
-			inList = false
-		}
+	var options *webpkg.RenderOptions
+	if tasks != nil {
+		options = &webpkg.RenderOptions{NoteID: tasks.NoteID, ReturnURL: tasks.ReturnURL}
 	}
-
-	for i, raw := range lines {
-		lineNo := content.BodyLine + i
-		trimmed := strings.TrimSpace(raw)
-		if strings.HasPrefix(trimmed, "```") {
-			closeList()
-			if inCode {
-				b.WriteString("</code></pre>")
-			} else {
-				b.WriteString("<pre><code>")
-			}
-			inCode = !inCode
-			continue
-		}
-
-		if inCode {
-			b.WriteString(html.EscapeString(raw))
-			b.WriteByte('\n')
-			continue
-		}
-
-		if trimmed == "" {
-			closeList()
-			continue
-		}
-
-		if strings.HasPrefix(trimmed, "### ") {
-			closeList()
-			b.WriteString("<h3>" + renderInlineMarkdown(noteID, strings.TrimSpace(trimmed[4:]), existing) + "</h3>")
-			continue
-		}
-		if strings.HasPrefix(trimmed, "## ") {
-			closeList()
-			b.WriteString("<h2>" + renderInlineMarkdown(noteID, strings.TrimSpace(trimmed[3:]), existing) + "</h2>")
-			continue
-		}
-		if strings.HasPrefix(trimmed, "# ") {
-			closeList()
-			b.WriteString("<h1>" + renderInlineMarkdown(noteID, strings.TrimSpace(trimmed[2:]), existing) + "</h1>")
-			continue
-		}
-
-		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
-			if !inList {
-				b.WriteString("<ul>")
-				inList = true
-			}
-			b.WriteString("<li>" + renderListItemMarkdown(noteID, strings.TrimSpace(trimmed[2:]), existing, tasks, lineNo) + "</li>")
-			continue
-		}
-
-		closeList()
-		b.WriteString("<p>" + renderInlineMarkdown(noteID, trimmed, existing) + "</p>")
-	}
-
-	closeList()
-	if inCode {
-		b.WriteString("</code></pre>")
-	}
-	return template.HTML(b.String())
+	return webpkg.RenderMarkdownHTML(noteID, toNotesContent(content), existing, options, now(), noteURL, attachmentURL)
 }
 
 func renderListItemMarkdown(noteID, text string, existing map[string]struct{}, tasks *taskRenderOptions, line int) string {
@@ -4282,29 +3853,11 @@ func resolveAttachmentSrc(noteID, raw string) string {
 }
 
 func openTasksFromBody(body string) []noteTask {
-	lines := strings.Split(body, "\n")
-	var tasks []noteTask
-	for i, raw := range lines {
-		trimmed := strings.TrimSpace(raw)
-		if !(strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ")) {
-			continue
-		}
-		task, ok := parseTaskLine(strings.TrimSpace(trimmed[2:]))
-		if !ok || !task.Open {
-			continue
-		}
-		task.Line = i + 1
-		tasks = append(tasks, task)
-	}
-	return tasks
+	return fromTasks(taskspkg.OpenFromBody(body, 1, ""))
 }
 
 func openTasksFromContent(content noteContent) []noteTask {
-	tasks := openTasksFromBody(content.Body)
-	for i := range tasks {
-		tasks[i].Line += content.BodyLine - 1
-	}
-	return tasks
+	return fromTasks(taskspkg.OpenFromBody(content.Body, content.BodyLine, ""))
 }
 
 func toggleTaskByLine(id string, line int) (noteTask, error) {
@@ -4328,139 +3881,61 @@ func toggleTaskByLine(id string, line int) (noteTask, error) {
 }
 
 func toggleTaskLine(data string, line int) (string, noteTask, error) {
-	lines := strings.Split(data, "\n")
-	if line < 1 || line > len(lines) {
-		return "", noteTask{}, fmt.Errorf("line %d is out of range", line)
-	}
-
-	raw := lines[line-1]
-	trimmed := strings.TrimLeft(raw, " \t")
-	if !(strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ")) {
-		return "", noteTask{}, fmt.Errorf("line %d is not a Markdown task", line)
-	}
-
-	task, ok := parseTaskLine(strings.TrimSpace(trimmed[2:]))
-	if !ok {
-		return "", noteTask{}, fmt.Errorf("line %d is not a Markdown task", line)
-	}
-
-	indent := raw[:len(raw)-len(trimmed)]
-	task.Open = !task.Open
-	state := "[x]"
-	if task.Open {
-		state = "[ ]"
-	}
-
-	lines[line-1] = indent + trimmed[:2] + state + " " + task.RawText
-	task.Line = line
-	return strings.Join(lines, "\n"), task, nil
+	updated, task, err := taskspkg.ToggleTaskLine(data, line)
+	return updated, fromTask(task), err
 }
 
 func parseTaskLine(text string) (noteTask, bool) {
-	if len(text) < 4 || text[0] != '[' || text[2] != ']' {
-		return noteTask{}, false
-	}
-	if text[3] != ' ' {
-		return noteTask{}, false
-	}
-
-	state := text[1]
-	rawText := strings.TrimSpace(text[4:])
-	body, dueDate, dueTime := splitTaskDue(rawText)
-	switch state {
-	case ' ':
-		return noteTask{Text: body, RawText: rawText, Open: true, DueDate: dueDate, DueTime: dueTime}, true
-	case 'x', 'X':
-		return noteTask{Text: body, RawText: rawText, Open: false, DueDate: dueDate, DueTime: dueTime}, true
-	default:
-		return noteTask{}, false
-	}
+	task, ok := taskspkg.ParseLine(text)
+	return fromTask(task), ok
 }
 
 func splitTaskDue(text string) (string, string, time.Time) {
-	matches := taskDuePattern.FindStringSubmatch(text)
-	if len(matches) != 2 {
-		return strings.TrimSpace(text), "", time.Time{}
-	}
-	dueTime, err := time.ParseInLocation("2006-01-02", matches[1], time.UTC)
-	if err != nil {
-		return strings.TrimSpace(text), "", time.Time{}
-	}
-	body := strings.TrimSpace(taskDuePattern.ReplaceAllString(text, ""))
-	return body, matches[1], dueTime
+	return taskspkg.SplitDue(text)
 }
 
 func annotateTaskDue(task noteTask, today time.Time) noteTask {
-	if task.DueDate == "" || task.DueTime.IsZero() {
-		return task
-	}
-	switch {
-	case task.DueTime.Before(today):
-		task.DueStatus = "overdue"
-	case task.DueTime.Equal(today):
-		task.DueStatus = "today"
-	default:
-		task.DueStatus = "upcoming"
-	}
-	return task
+	return fromTask(taskspkg.AnnotateDue(toTask(task), today))
 }
 
 func taskMatchesView(task noteTask, view string) bool {
-	switch view {
-	case "upcoming":
-		return task.DueStatus == "today" || task.DueStatus == "upcoming"
-	case "overdue":
-		return task.DueStatus == "overdue"
-	default:
-		return true
-	}
+	return taskspkg.MatchesView(toTask(task), view)
 }
 
 func formatTaskDueSuffix(task webTask) string {
-	if task.DueDate == "" {
-		return ""
-	}
-	switch task.DueStatus {
-	case "overdue":
-		return " (due " + task.DueDate + ", overdue)"
-	case "today":
-		return " (due " + task.DueDate + ", today)"
-	default:
-		return " (due " + task.DueDate + ")"
-	}
+	return taskspkg.FormatDueSuffix(taskspkg.GroupTask{
+		Text:      task.Text,
+		Line:      task.Line,
+		DueDate:   task.DueDate,
+		DueStatus: task.DueStatus,
+	})
 }
 
 func nextDueDate(tasks []webTask) string {
-	next := ""
+	groupTasks := make([]taskspkg.GroupTask, 0, len(tasks))
 	for _, task := range tasks {
-		if task.DueDate == "" {
-			continue
-		}
-		if next == "" || task.DueDate < next {
-			next = task.DueDate
-		}
+		groupTasks = append(groupTasks, taskspkg.GroupTask{
+			Text:      task.Text,
+			Line:      task.Line,
+			DueDate:   task.DueDate,
+			DueStatus: task.DueStatus,
+		})
 	}
-	return next
+	return taskspkg.NextDueDate(groupTasks)
 }
 
 func sortTaskGroups(groups []webTaskGroup, view string) {
+	orderable := make([]taskspkg.Group, 0, len(groups))
+	for _, group := range groups {
+		orderable = append(orderable, taskspkg.Group{ID: group.ID, ModTime: group.ModTime, NextDue: group.NextDue})
+	}
+	taskspkg.SortGroups(orderable, view)
+	order := make(map[string]int, len(orderable))
+	for i, group := range orderable {
+		order[group.ID] = i
+	}
 	sort.Slice(groups, func(i, j int) bool {
-		if view != "all" {
-			if groups[i].NextDue != groups[j].NextDue {
-				switch {
-				case groups[i].NextDue == "":
-					return false
-				case groups[j].NextDue == "":
-					return true
-				default:
-					return groups[i].NextDue < groups[j].NextDue
-				}
-			}
-		}
-		if groups[i].ModTime == groups[j].ModTime {
-			return groups[i].ID < groups[j].ID
-		}
-		return groups[i].ModTime > groups[j].ModTime
+		return order[groups[i].ID] < order[groups[j].ID]
 	})
 }
 
