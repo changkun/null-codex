@@ -20,6 +20,8 @@ go run . search shipped --tag work
 go run . search shipped --include-archived
 go run . search --tag review
 go run . view daily-log
+go run . links daily-log
+go run . backlinks daily-log
 go run . delete daily-log
 go run . doctor
 ```
@@ -34,6 +36,8 @@ go run . doctor
 - `search` performs case-insensitive full-text search across note titles and bodies, can be narrowed to notes matching all requested tags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `today` creates `notes/YYYY-MM-DD.md` when missing and opens today's daily note in `$EDITOR`.
 - `view` prints the raw Markdown note content.
+- `links` lists the note IDs referenced by `[[note-id]]` links in a note body.
+- `backlinks` lists the note IDs that link to the requested note.
 - `delete` removes the note file from `notes/`.
 - `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets.
 

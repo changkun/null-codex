@@ -1,0 +1,3 @@
+{
+  "result": "Implement graph navigation commands: add `links <note-id>` and `backlinks <note-id>` so the CLI can traverse the `[[note-id]]` network directly instead of only surfacing link health through `view` and `doctor`."
+}

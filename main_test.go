@@ -1059,6 +1059,147 @@ func TestViewNotePrintsRawMarkdownWhenNoLinkMetadataExists(t *testing.T) {
 	}
 }
 
+func TestListNoteLinksPrintsOutgoingLinks(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("target"), []byte("# Target\n\nSee [[beta]] and [[ alpha ]] and [[beta]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listNoteLinks([]string{"target"}); err != nil {
+			t.Fatalf("listNoteLinks returned error: %v", err)
+		}
+	})
+
+	if output != "beta\nalpha\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestListNoteLinksPrintsEmptyMessage(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("solo"), []byte("# Solo\n\nNo references here.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listNoteLinks([]string{"solo"}); err != nil {
+			t.Fatalf("listNoteLinks returned error: %v", err)
+		}
+	})
+
+	if output != "no links found\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestListNoteBacklinksPrintsSources(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("target"), []byte("# Target\n\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("source-b"), []byte("# Source B\n\nPoints at [[target]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("source-a"), []byte("# Source A\nArchived: true\n\nPoints at [[target]] twice: [[target]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listNoteBacklinks([]string{"target"}); err != nil {
+			t.Fatalf("listNoteBacklinks returned error: %v", err)
+		}
+	})
+
+	if output != "source-a\nsource-b\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestListNoteBacklinksPrintsEmptyMessage(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("solo"), []byte("# Solo\n\nNo references here.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listNoteBacklinks([]string{"solo"}); err != nil {
+			t.Fatalf("listNoteBacklinks returned error: %v", err)
+		}
+	})
+
+	if output != "no backlinks found\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestLinksAndBacklinksRequireExistingNote(t *testing.T) {
+	withTempDir(t)
+
+	err := listNoteLinks([]string{"missing"})
+	if err == nil || err.Error() != "note \"missing\" not found" {
+		t.Fatalf("expected missing note error from links, got %v", err)
+	}
+
+	err = listNoteBacklinks([]string{"missing"})
+	if err == nil || err.Error() != "note \"missing\" not found" {
+		t.Fatalf("expected missing note error from backlinks, got %v", err)
+	}
+}
+
+func TestRunIncludesLinksAndBacklinksCommands(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("target"), []byte("# Target\n\nLinks to [[outgoing]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("source"), []byte("# Source\n\nPoints at [[target]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	linksOutput := captureStdout(t, func() {
+		if err := run([]string{"links", "target"}); err != nil {
+			t.Fatalf("run returned error for links: %v", err)
+		}
+	})
+	if linksOutput != "outgoing\n" {
+		t.Fatalf("unexpected links stdout: %q", linksOutput)
+	}
+
+	backlinksOutput := captureStdout(t, func() {
+		if err := run([]string{"backlinks", "target"}); err != nil {
+			t.Fatalf("run returned error for backlinks: %v", err)
+		}
+	})
+	if backlinksOutput != "source\n" {
+		t.Fatalf("unexpected backlinks stdout: %q", backlinksOutput)
+	}
+}
+
 func withTempDir(t *testing.T) {
 	t.Helper()
 

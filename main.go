@@ -80,6 +80,10 @@ func run(args []string) error {
 		return openTodayNote()
 	case "view", "show":
 		return viewNote(args[1:])
+	case "links":
+		return listNoteLinks(args[1:])
+	case "backlinks":
+		return listNoteBacklinks(args[1:])
 	case "delete", "rm":
 		return deleteNote(args[1:])
 	case "doctor":
@@ -284,17 +288,12 @@ func viewNote(args []string) error {
 	}
 
 	id := args[0]
-	path := notePath(id)
-
-	data, err := os.ReadFile(path)
+	data, err := readExistingNote(id)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("note %q not found", id)
-		}
 		return err
 	}
 
-	content := parseNoteContent(path, string(data))
+	content := parseNoteContent(notePath(id), string(data))
 	links := extractNoteLinks(content.Body)
 	backlinks, err := findBacklinks(id)
 	if err != nil {
@@ -315,6 +314,55 @@ func viewNote(args []string) error {
 	}
 	if len(backlinks) > 0 {
 		fmt.Printf("Backlinks: %s\n", strings.Join(backlinks, ", "))
+	}
+	return nil
+}
+
+func listNoteLinks(args []string) error {
+	if len(args) != 1 {
+		return errors.New("links requires a note id")
+	}
+
+	id := args[0]
+	data, err := readExistingNote(id)
+	if err != nil {
+		return err
+	}
+
+	content := parseNoteContent(notePath(id), string(data))
+	links := extractNoteLinks(content.Body)
+	if len(links) == 0 {
+		fmt.Println("no links found")
+		return nil
+	}
+
+	for _, link := range links {
+		fmt.Println(link)
+	}
+	return nil
+}
+
+func listNoteBacklinks(args []string) error {
+	if len(args) != 1 {
+		return errors.New("backlinks requires a note id")
+	}
+
+	id := args[0]
+	if _, err := readExistingNote(id); err != nil {
+		return err
+	}
+
+	backlinks, err := findBacklinks(id)
+	if err != nil {
+		return err
+	}
+	if len(backlinks) == 0 {
+		fmt.Println("no backlinks found")
+		return nil
+	}
+
+	for _, backlink := range backlinks {
+		fmt.Println(backlink)
 	}
 	return nil
 }
@@ -724,6 +772,17 @@ func findBacklinks(targetID string) ([]string, error) {
 	return backlinks, nil
 }
 
+func readExistingNote(id string) ([]byte, error) {
+	data, err := os.ReadFile(notePath(id))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("note %q not found", id)
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
 func inspectNotebook(notes []noteMeta) ([]brokenLink, []string, error) {
 	noteSet := make(map[string]struct{}, len(notes))
 	backlinkCounts := make(map[string]int, len(notes))
@@ -992,6 +1051,8 @@ func printUsage() {
 	fmt.Println("  search <query> [--tag <tag>]... [--include-archived|--archived-only] Search note titles and bodies")
 	fmt.Println("  today                     Create or open today's daily note")
 	fmt.Println("  view <id>                 Print a note")
+	fmt.Println("  links <id>                List outgoing [[note-id]] links from a note")
+	fmt.Println("  backlinks <id>            List notes that link to a note")
 	fmt.Println("  delete <id>               Delete a note")
 	fmt.Println("  doctor                    Check for broken wiki links and orphaned notes")
 }
