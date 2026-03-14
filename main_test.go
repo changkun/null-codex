@@ -10,6 +10,30 @@ import (
 	"time"
 )
 
+func TestCreateNoteStoresTags(t *testing.T) {
+	withTempDir(t)
+
+	output := captureStdout(t, func() {
+		if err := createNote([]string{"Project Ideas", "--tag", "Work", "--tags", "Research, writing", "Build", "a", "tagged", "note."}); err != nil {
+			t.Fatalf("createNote returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(notePath("project-ideas"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "# Project Ideas\nTags: research, work, writing\n\nBuild a tagged note.\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+
+	if output != "created project-ideas\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
 func TestEditNoteReplacesBodyFromCLI(t *testing.T) {
 	withTempDir(t)
 
@@ -23,7 +47,7 @@ func TestEditNoteReplacesBodyFromCLI(t *testing.T) {
 	}
 
 	output := captureStdout(t, func() {
-		if err := editNote([]string{"daily-log", "New", "body"}); err != nil {
+		if err := editNote([]string{"daily-log", "--tag", "journal", "New", "body"}); err != nil {
 			t.Fatalf("editNote returned error: %v", err)
 		}
 	})
@@ -33,12 +57,64 @@ func TestEditNoteReplacesBodyFromCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if string(got) != "# Daily Log\n\nNew body\n" {
+	if string(got) != "# Daily Log\nTags: journal\n\nNew body\n" {
 		t.Fatalf("unexpected file contents: %q", string(got))
 	}
 
 	if output != "edited daily-log\n" {
 		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestEditNoteUpdatesOnlyTagsFromCLI(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	path := notePath("daily-log")
+	if err := os.WriteFile(path, []byte("# Daily Log\n\nExisting body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := editNote([]string{"daily-log", "--tags", "work, urgent"}); err != nil {
+		t.Fatalf("editNote returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != "# Daily Log\nTags: urgent, work\n\nExisting body\n" {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+}
+
+func TestEditNoteCanClearTags(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	path := notePath("daily-log")
+	if err := os.WriteFile(path, []byte("# Daily Log\nTags: urgent, work\n\nExisting body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := editNote([]string{"daily-log", "--clear-tags"}); err != nil {
+		t.Fatalf("editNote returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != "# Daily Log\n\nExisting body\n" {
+		t.Fatalf("unexpected file contents: %q", string(got))
 	}
 }
 
@@ -88,6 +164,36 @@ func TestRunIncludesEditCommand(t *testing.T) {
 	}
 }
 
+func TestListNotesFiltersByTag(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("project-ideas"), []byte("# Project Ideas\nTags: work, writing\n\nPlan docs.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("garden-log"), []byte("# Garden Log\nTags: home\n\nWater tomatoes.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := listNotes([]string{"--tag", "work"}); err != nil {
+			t.Fatalf("listNotes returned error: %v", err)
+		}
+	})
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 matching note, got %d in %q", len(lines), output)
+	}
+	if !strings.Contains(lines[0], "project-ideas") || !strings.Contains(lines[0], "work,writing") {
+		t.Fatalf("unexpected list output: %q", lines[0])
+	}
+}
+
 func TestSearchNotesMatchesTitleAndBody(t *testing.T) {
 	withTempDir(t)
 
@@ -95,11 +201,11 @@ func TestSearchNotesMatchesTitleAndBody(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(notePath("project-ideas"), []byte("# Project Ideas\n\nBuild a search command.\n"), 0o644); err != nil {
+	if err := os.WriteFile(notePath("project-ideas"), []byte("# Project Ideas\nTags: work\n\nBuild a search command.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(10 * time.Millisecond)
-	if err := os.WriteFile(notePath("weekly-review"), []byte("# Weekly Review\n\nSearch indexing can wait.\n"), 0o644); err != nil {
+	if err := os.WriteFile(notePath("weekly-review"), []byte("# Weekly Review\nTags: review\n\nSearch indexing can wait.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -117,6 +223,9 @@ func TestSearchNotesMatchesTitleAndBody(t *testing.T) {
 	if !strings.Contains(lines[0], "weekly-review") || !strings.Contains(lines[0], "Weekly Review") {
 		t.Fatalf("expected newest note first, got %q", lines[0])
 	}
+	if !strings.Contains(lines[0], "review") {
+		t.Fatalf("expected tag column in output, got %q", lines[0])
+	}
 
 	if !strings.Contains(lines[1], "project-ideas") || !strings.Contains(lines[1], "Project Ideas") {
 		t.Fatalf("expected older note second, got %q", lines[1])
@@ -127,8 +236,68 @@ func TestSearchNotesRequiresQuery(t *testing.T) {
 	withTempDir(t)
 
 	err := searchNotes(nil)
-	if err == nil || err.Error() != "search requires a query" {
+	if err == nil || err.Error() != "search requires a query or at least one --tag" {
 		t.Fatalf("expected missing query error, got %v", err)
+	}
+}
+
+func TestSearchNotesCanFilterByTagOnly(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("project-ideas"), []byte("# Project Ideas\nTags: work, writing\n\nBuild docs.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("garden-log"), []byte("# Garden Log\nTags: home\n\nPlant herbs.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := searchNotes([]string{"--tag", "writing"}); err != nil {
+			t.Fatalf("searchNotes returned error: %v", err)
+		}
+	})
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 matching note, got %d in %q", len(lines), output)
+	}
+	if !strings.Contains(lines[0], "project-ideas") || !strings.Contains(lines[0], "work,writing") {
+		t.Fatalf("unexpected search output: %q", lines[0])
+	}
+}
+
+func TestSearchNotesAppliesTagFilterAlongsideQuery(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("project-ideas"), []byte("# Project Ideas\nTags: work\n\nBuild a search command.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(notePath("weekly-review"), []byte("# Weekly Review\nTags: review\n\nSearch indexing can wait.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := searchNotes([]string{"search", "--tag", "work"}); err != nil {
+			t.Fatalf("searchNotes returned error: %v", err)
+		}
+	})
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 matching note, got %d in %q", len(lines), output)
+	}
+	if !strings.Contains(lines[0], "project-ideas") {
+		t.Fatalf("unexpected search output: %q", lines[0])
 	}
 }
 

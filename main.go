@@ -20,7 +20,20 @@ var now = time.Now
 type noteMeta struct {
 	ID      string
 	Title   string
+	Tags    []string
 	ModTime time.Time
+}
+
+type noteContent struct {
+	Title string
+	Tags  []string
+	Body  string
+}
+
+type noteOptions struct {
+	Tags      []string
+	ClearTags bool
+	Body      string
 }
 
 func main() {
@@ -42,7 +55,7 @@ func run(args []string) error {
 	case "edit":
 		return editNote(args[1:])
 	case "list", "ls":
-		return listNotes()
+		return listNotes(args[1:])
 	case "search":
 		return searchNotes(args[1:])
 	case "today":
@@ -69,9 +82,9 @@ func createNote(args []string) error {
 		return errors.New("title cannot be empty")
 	}
 
-	body := ""
-	if len(args) > 1 {
-		body = strings.Join(args[1:], " ")
+	opts, err := parseNoteOptions(args[1:])
+	if err != nil {
+		return err
 	}
 
 	if err := os.MkdirAll(notesDir, 0o755); err != nil {
@@ -83,7 +96,11 @@ func createNote(args []string) error {
 		return err
 	}
 
-	content := formatNote(title, body)
+	content := formatNote(noteContent{
+		Title: title,
+		Tags:  opts.Tags,
+		Body:  opts.Body,
+	})
 
 	path := notePath(id)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -94,31 +111,34 @@ func createNote(args []string) error {
 	return nil
 }
 
-func listNotes() error {
+func listNotes(args []string) error {
+	opts, err := parseFilterOptions(args)
+	if err != nil {
+		return err
+	}
+
 	notes, err := loadNotes()
 	if err != nil {
 		return err
 	}
+
+	notes = filterNotesByTags(notes, opts.Tags)
 	if len(notes) == 0 {
 		fmt.Println("no notes found")
 		return nil
 	}
 
 	for _, note := range notes {
-		fmt.Printf("%s\t%s\t%s\n", note.ID, note.ModTime.Format(time.RFC3339), note.Title)
+		fmt.Printf("%s\t%s\t%s\t%s\n", note.ID, note.ModTime.Format(time.RFC3339), note.Title, formatTags(note.Tags))
 	}
 
 	return nil
 }
 
 func searchNotes(args []string) error {
-	if len(args) == 0 {
-		return errors.New("search requires a query")
-	}
-
-	query := strings.TrimSpace(strings.Join(args, " "))
-	if query == "" {
-		return errors.New("search query cannot be empty")
+	opts, err := parseSearchOptions(args)
+	if err != nil {
+		return err
 	}
 
 	notes, err := loadNotes()
@@ -126,9 +146,15 @@ func searchNotes(args []string) error {
 		return err
 	}
 
-	query = strings.ToLower(query)
+	notes = filterNotesByTags(notes, opts.Tags)
+	query := strings.ToLower(opts.Body)
 	var matches []noteMeta
 	for _, note := range notes {
+		if query == "" {
+			matches = append(matches, note)
+			continue
+		}
+
 		body, err := os.ReadFile(notePath(note.ID))
 		if err != nil {
 			return err
@@ -146,7 +172,7 @@ func searchNotes(args []string) error {
 	}
 
 	for _, note := range matches {
-		fmt.Printf("%s\t%s\t%s\n", note.ID, note.ModTime.Format(time.RFC3339), note.Title)
+		fmt.Printf("%s\t%s\t%s\t%s\n", note.ID, note.ModTime.Format(time.RFC3339), note.Title, formatTags(note.Tags))
 	}
 
 	return nil
@@ -164,7 +190,7 @@ func openTodayNote() error {
 			return err
 		}
 
-		content := formatNote(today, "")
+		content := formatNote(noteContent{Title: today})
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			return err
 		}
@@ -192,14 +218,31 @@ func editNote(args []string) error {
 		return openInEditor(path)
 	}
 
-	title, err := readTitle(path)
+	content, err := readNoteContent(path)
 	if err != nil {
 		return err
 	}
 
-	body := strings.Join(args[1:], " ")
-	content := formatNote(title, body)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	opts, err := parseNoteOptions(args[1:])
+	if err != nil {
+		return err
+	}
+
+	if opts.Body == "" && len(opts.Tags) == 0 && !opts.ClearTags {
+		return openInEditor(path)
+	}
+
+	if opts.Body != "" {
+		content.Body = opts.Body
+	}
+	if opts.ClearTags {
+		content.Tags = nil
+	}
+	if len(opts.Tags) > 0 {
+		content.Tags = opts.Tags
+	}
+
+	if err := os.WriteFile(path, []byte(formatNote(content)), 0o644); err != nil {
 		return err
 	}
 
@@ -280,23 +323,58 @@ func nextNoteID(title string) (string, error) {
 }
 
 func readTitle(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	content, err := readNoteContent(path)
 	if err != nil {
 		return "", err
 	}
+	return content.Title, nil
+}
 
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "# ") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "# ")), nil
+func readNoteContent(path string) (noteContent, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return noteContent{}, err
+	}
+
+	return parseNoteContent(path, string(data)), nil
+}
+
+func parseNoteContent(path, data string) noteContent {
+	lines := strings.Split(data, "\n")
+	content := noteContent{
+		Title: strings.TrimSuffix(filepath.Base(path), ".md"),
+	}
+
+	bodyStart := 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
 		}
-		if line != "" {
-			return line, nil
+		if strings.HasPrefix(trimmed, "# ") {
+			content.Title = strings.TrimSpace(strings.TrimPrefix(trimmed, "# "))
+			bodyStart = i + 1
+		} else {
+			content.Title = trimmed
+			bodyStart = i + 1
+		}
+		break
+	}
+
+	if bodyStart < len(lines) {
+		line := strings.TrimSpace(lines[bodyStart])
+		if strings.HasPrefix(strings.ToLower(line), "tags:") {
+			content.Tags = normalizeTags(strings.Split(strings.TrimSpace(line[5:]), ","))
+			bodyStart++
 		}
 	}
 
-	return strings.TrimSuffix(filepath.Base(path), ".md"), nil
+	for bodyStart < len(lines) && strings.TrimSpace(lines[bodyStart]) == "" {
+		bodyStart++
+	}
+	content.Body = strings.TrimRight(strings.Join(lines[bodyStart:], "\n"), "\n")
+
+	return content
 }
 
 func loadNotes() ([]noteMeta, error) {
@@ -320,14 +398,15 @@ func loadNotes() ([]noteMeta, error) {
 		}
 
 		id := strings.TrimSuffix(entry.Name(), ".md")
-		title, err := readTitle(notePath(id))
+		content, err := readNoteContent(notePath(id))
 		if err != nil {
 			return nil, err
 		}
 
 		notes = append(notes, noteMeta{
 			ID:      id,
-			Title:   title,
+			Title:   content.Title,
+			Tags:    content.Tags,
 			ModTime: info.ModTime(),
 		})
 	}
@@ -343,12 +422,18 @@ func notePath(id string) string {
 	return filepath.Join(notesDir, id+".md")
 }
 
-func formatNote(title, body string) string {
-	content := fmt.Sprintf("# %s\n\n", title)
-	if body != "" {
-		content += body + "\n"
+func formatNote(note noteContent) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s\n", note.Title)
+	if len(note.Tags) > 0 {
+		fmt.Fprintf(&b, "Tags: %s\n", strings.Join(note.Tags, ", "))
 	}
-	return content
+	b.WriteString("\n")
+	if note.Body != "" {
+		b.WriteString(note.Body)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func slugify(input string) string {
@@ -371,14 +456,133 @@ func slugify(input string) string {
 	return strings.Trim(b.String(), "-")
 }
 
+func normalizeTags(tags []string) []string {
+	seen := make(map[string]struct{})
+	var normalized []string
+	for _, tag := range tags {
+		tag = slugify(tag)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		normalized = append(normalized, tag)
+	}
+	sort.Strings(normalized)
+	return normalized
+}
+
+func parseNoteOptions(args []string) (noteOptions, error) {
+	var opts noteOptions
+	var bodyParts []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--clear-tags":
+			opts.ClearTags = true
+		case arg == "--tag":
+			if i+1 >= len(args) {
+				return noteOptions{}, errors.New("--tag requires a value")
+			}
+			opts.Tags = append(opts.Tags, args[i+1])
+			i++
+		case strings.HasPrefix(arg, "--tag="):
+			opts.Tags = append(opts.Tags, strings.TrimPrefix(arg, "--tag="))
+		case arg == "--tags":
+			if i+1 >= len(args) {
+				return noteOptions{}, errors.New("--tags requires a value")
+			}
+			opts.Tags = append(opts.Tags, strings.Split(args[i+1], ",")...)
+			i++
+		case strings.HasPrefix(arg, "--tags="):
+			opts.Tags = append(opts.Tags, strings.Split(strings.TrimPrefix(arg, "--tags="), ",")...)
+		default:
+			bodyParts = append(bodyParts, arg)
+		}
+	}
+
+	opts.Tags = normalizeTags(opts.Tags)
+	opts.Body = strings.TrimSpace(strings.Join(bodyParts, " "))
+	return opts, nil
+}
+
+func parseFilterOptions(args []string) (noteOptions, error) {
+	opts, err := parseNoteOptions(args)
+	if err != nil {
+		return noteOptions{}, err
+	}
+	if opts.Body != "" {
+		return noteOptions{}, fmt.Errorf("unexpected argument %q", opts.Body)
+	}
+	if opts.ClearTags {
+		return noteOptions{}, errors.New("--clear-tags is only valid for create/edit")
+	}
+	return opts, nil
+}
+
+func parseSearchOptions(args []string) (noteOptions, error) {
+	opts, err := parseNoteOptions(args)
+	if err != nil {
+		return noteOptions{}, err
+	}
+	if opts.ClearTags {
+		return noteOptions{}, errors.New("--clear-tags is only valid for create/edit")
+	}
+	if opts.Body == "" && len(opts.Tags) == 0 {
+		return noteOptions{}, errors.New("search requires a query or at least one --tag")
+	}
+	return opts, nil
+}
+
+func filterNotesByTags(notes []noteMeta, tags []string) []noteMeta {
+	if len(tags) == 0 {
+		return notes
+	}
+
+	var filtered []noteMeta
+	for _, note := range notes {
+		if hasAllTags(note.Tags, tags) {
+			filtered = append(filtered, note)
+		}
+	}
+	return filtered
+}
+
+func hasAllTags(noteTags, filterTags []string) bool {
+	if len(filterTags) == 0 {
+		return true
+	}
+
+	tagSet := make(map[string]struct{}, len(noteTags))
+	for _, tag := range noteTags {
+		tagSet[tag] = struct{}{}
+	}
+	for _, tag := range filterTags {
+		if _, ok := tagSet[tag]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func formatTags(tags []string) string {
+	if len(tags) == 0 {
+		return "-"
+	}
+	return strings.Join(tags, ",")
+}
+
 func printUsage() {
 	fmt.Println("notes <command> [arguments]")
 	fmt.Println("")
 	fmt.Println("Commands:")
-	fmt.Println("  create <title> [content]  Create a Markdown note")
-	fmt.Println("  edit <id> [content]       Replace note body or open in $EDITOR")
-	fmt.Println("  list                      List saved notes")
-	fmt.Println("  search <query>            Search note titles and bodies")
+	fmt.Println("  create <title> [content] [--tag <tag>] [--tags a,b]  Create a Markdown note")
+	fmt.Println("  edit <id> [content] [--tag <tag>] [--tags a,b]       Replace note body/tags or open in $EDITOR")
+	fmt.Println("  list [--tag <tag>]...                                 List saved notes")
+	fmt.Println("  search <query> [--tag <tag>]...                       Search note titles and bodies")
 	fmt.Println("  today                     Create or open today's daily note")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  delete <id>               Delete a note")

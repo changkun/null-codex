@@ -1,0 +1,3 @@
+{
+  "result": "Add first-class note tagging, including `create`/`edit` support for tags and `list`/`search` filters by tag, so the CLI can scale beyond a flat folder of notes."
+}
