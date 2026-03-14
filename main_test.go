@@ -35,6 +35,104 @@ func TestCreateNoteStoresTags(t *testing.T) {
 	}
 }
 
+func TestCreateNoteFromTemplateUsesDefaultTitleAndBody(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	output := captureStdout(t, func() {
+		if err := createNote([]string{"--template", "daily"}); err != nil {
+			t.Fatalf("createNote returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(notePath("2026-03-14"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "# 2026-03-14\nTags: daily\n\n## Top of Mind\n\n## Priorities\n- [ ]\n\n## Notes\n\n## Wins\n\n## Tomorrow\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+	if output != "created 2026-03-14\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestTemplateCommandCreatesMeetingNote(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	output := captureStdout(t, func() {
+		if err := templateNote([]string{"meeting", "Weekly Sync", "--tag", "team"}); err != nil {
+			t.Fatalf("templateNote returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(notePath("weekly-sync"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "# Weekly Sync\nTags: meeting, team\n\n## Details\n- Date: 2026-03-14\n- Attendees:\n- Agenda:\n\n## Notes\n\n## Decisions\n\n## Action Items\n- [ ]\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+	if output != "created weekly-sync\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestTemplateCommandListsBuiltIns(t *testing.T) {
+	withTempDir(t)
+
+	output := captureStdout(t, func() {
+		if err := templateNote(nil); err != nil {
+			t.Fatalf("templateNote returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "daily") || !strings.Contains(output, "meeting") || !strings.Contains(output, "project") {
+		t.Fatalf("expected built-in templates in output, got %q", output)
+	}
+}
+
+func TestRunIncludesTemplateCommand(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := run([]string{"template", "project", "Roadmap"}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("roadmap"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(got), "Tags: project") || !strings.Contains(string(got), "## Milestones") {
+		t.Fatalf("unexpected template-generated note: %q", string(got))
+	}
+}
+
+func TestEditRejectsTemplateFlag(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	path := notePath("daily-log")
+	if err := os.WriteFile(path, []byte("# Daily Log\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := editNote([]string{"daily-log", "--template", "meeting"})
+	if err == nil || err.Error() != "--template is only valid for create/template" {
+		t.Fatalf("expected template flag error, got %v", err)
+	}
+}
+
 func TestEditNoteReplacesBodyFromCLI(t *testing.T) {
 	withTempDir(t)
 
@@ -670,7 +768,8 @@ func TestOpenTodayNoteCreatesDailyNote(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if string(got) != "# 2026-03-14\n\n" {
+	want := "# 2026-03-14\nTags: daily\n\n## Top of Mind\n\n## Priorities\n- [ ]\n\n## Notes\n\n## Wins\n\n## Tomorrow\n"
+	if string(got) != want {
 		t.Fatalf("unexpected file contents: %q", string(got))
 	}
 }

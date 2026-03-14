@@ -51,6 +51,20 @@ type noteOptions struct {
 	IncludeArchived bool
 	ArchivedOnly    bool
 	Body            string
+	Template        string
+}
+
+type createOptions struct {
+	noteOptions
+	Title string
+}
+
+type noteTemplate struct {
+	Name         string
+	Description  string
+	DefaultTitle func() string
+	DefaultTags  []string
+	Body         func(title string) string
 }
 
 func main() {
@@ -69,6 +83,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "create", "new":
 		return createNote(args[1:])
+	case "template":
+		return templateNote(args[1:])
 	case "edit":
 		return editNote(args[1:])
 	case "list", "ls":
@@ -102,45 +118,34 @@ func run(args []string) error {
 }
 
 func createNote(args []string) error {
+	opts, err := parseCreateOptions(args)
+	if err != nil {
+		return err
+	}
+	return createNoteFromOptions(opts)
+}
+
+func templateNote(args []string) error {
 	if len(args) == 0 {
-		return errors.New("create requires a title")
+		printTemplates()
+		return nil
+	}
+	if len(args) == 1 && args[0] == "list" {
+		printTemplates()
+		return nil
 	}
 
-	title := strings.TrimSpace(args[0])
-	if title == "" {
-		return errors.New("title cannot be empty")
+	templateName := strings.TrimSpace(args[0])
+	if templateName == "" {
+		return errors.New("template requires a template name")
 	}
 
-	opts, err := parseNoteOptions(args[1:])
-	if err != nil {
-		return err
-	}
-	if err := validateMutationOptions(opts); err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(notesDir, 0o755); err != nil {
-		return err
-	}
-
-	id, err := nextNoteID(title)
+	opts, err := parseCreateOptions(append([]string{"--template", templateName}, args[1:]...))
 	if err != nil {
 		return err
 	}
 
-	content := formatNote(noteContent{
-		Title: title,
-		Tags:  opts.Tags,
-		Body:  opts.Body,
-	})
-
-	path := notePath(id)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return err
-	}
-
-	fmt.Printf("created %s\n", id)
-	return nil
+	return createNoteFromOptions(opts)
 }
 
 func listNotes(args []string) error {
@@ -294,15 +299,20 @@ func openTodayNote() error {
 		return err
 	}
 
-	today := now().Format("2006-01-02")
+	today := defaultDailyTitle()
 	path := notePath(today)
 	if _, err := os.Stat(path); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 
-		content := formatNote(noteContent{Title: today})
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		_, content, err := buildNoteFromOptions(createOptions{
+			noteOptions: noteOptions{Template: "daily"},
+		})
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, []byte(formatNote(content)), 0o644); err != nil {
 			return err
 		}
 	}
@@ -603,6 +613,65 @@ func openInEditor(path string) error {
 	cmd.Stderr = os.Stderr
 
 	return cmd.Run()
+}
+
+func createNoteFromOptions(opts createOptions) error {
+	if err := validateCreateOptions(opts.noteOptions); err != nil {
+		return err
+	}
+
+	id, content, err := buildNoteFromOptions(opts)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(notePath(id), []byte(formatNote(content)), 0o644); err != nil {
+		return err
+	}
+
+	fmt.Printf("created %s\n", id)
+	return nil
+}
+
+func buildNoteFromOptions(opts createOptions) (string, noteContent, error) {
+	title := strings.TrimSpace(opts.Title)
+	content := noteContent{
+		Title: title,
+		Tags:  append([]string(nil), opts.Tags...),
+		Body:  opts.Body,
+	}
+
+	if opts.Template != "" {
+		template, ok := builtInTemplates()[opts.Template]
+		if !ok {
+			return "", noteContent{}, fmt.Errorf("unknown template %q", opts.Template)
+		}
+		if title == "" {
+			title = template.DefaultTitle()
+		}
+		if title == "" {
+			return "", noteContent{}, errors.New("title cannot be empty")
+		}
+		content.Title = title
+		if opts.Body == "" {
+			content.Body = template.Body(title)
+		}
+		content.Tags = normalizeTags(append(append([]string(nil), template.DefaultTags...), opts.Tags...))
+	} else {
+		if title == "" {
+			return "", noteContent{}, errors.New("create requires a title")
+		}
+	}
+
+	id, err := nextNoteID(title)
+	if err != nil {
+		return "", noteContent{}, err
+	}
+	return id, content, nil
 }
 
 func nextNoteID(title string) (string, error) {
@@ -965,6 +1034,58 @@ func normalizeTags(tags []string) []string {
 	return normalized
 }
 
+func parseCreateOptions(args []string) (createOptions, error) {
+	var opts createOptions
+	var positionals []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--clear-tags":
+			opts.ClearTags = true
+		case arg == "--include-archived":
+			opts.IncludeArchived = true
+		case arg == "--archived-only":
+			opts.ArchivedOnly = true
+		case arg == "--tag":
+			if i+1 >= len(args) {
+				return createOptions{}, errors.New("--tag requires a value")
+			}
+			opts.Tags = append(opts.Tags, args[i+1])
+			i++
+		case strings.HasPrefix(arg, "--tag="):
+			opts.Tags = append(opts.Tags, strings.TrimPrefix(arg, "--tag="))
+		case arg == "--tags":
+			if i+1 >= len(args) {
+				return createOptions{}, errors.New("--tags requires a value")
+			}
+			opts.Tags = append(opts.Tags, strings.Split(args[i+1], ",")...)
+			i++
+		case strings.HasPrefix(arg, "--tags="):
+			opts.Tags = append(opts.Tags, strings.Split(strings.TrimPrefix(arg, "--tags="), ",")...)
+		case arg == "--template":
+			if i+1 >= len(args) {
+				return createOptions{}, errors.New("--template requires a value")
+			}
+			opts.Template = strings.TrimSpace(strings.ToLower(args[i+1]))
+			i++
+		case strings.HasPrefix(arg, "--template="):
+			opts.Template = strings.TrimSpace(strings.ToLower(strings.TrimPrefix(arg, "--template=")))
+		default:
+			positionals = append(positionals, arg)
+		}
+	}
+
+	opts.Tags = normalizeTags(opts.Tags)
+	if len(positionals) > 0 {
+		opts.Title = strings.TrimSpace(positionals[0])
+	}
+	if len(positionals) > 1 {
+		opts.Body = strings.TrimSpace(strings.Join(positionals[1:], " "))
+	}
+	return opts, nil
+}
+
 func parseNoteOptions(args []string) (noteOptions, error) {
 	var opts noteOptions
 	var bodyParts []string
@@ -994,6 +1115,14 @@ func parseNoteOptions(args []string) (noteOptions, error) {
 			i++
 		case strings.HasPrefix(arg, "--tags="):
 			opts.Tags = append(opts.Tags, strings.Split(strings.TrimPrefix(arg, "--tags="), ",")...)
+		case arg == "--template":
+			if i+1 >= len(args) {
+				return noteOptions{}, errors.New("--template requires a value")
+			}
+			opts.Template = strings.TrimSpace(strings.ToLower(args[i+1]))
+			i++
+		case strings.HasPrefix(arg, "--template="):
+			opts.Template = strings.TrimSpace(strings.ToLower(strings.TrimPrefix(arg, "--template=")))
 		default:
 			bodyParts = append(bodyParts, arg)
 		}
@@ -1015,6 +1144,9 @@ func parseFilterOptions(args []string) (noteOptions, error) {
 	if opts.ClearTags {
 		return noteOptions{}, errors.New("--clear-tags is only valid for create/edit")
 	}
+	if opts.Template != "" {
+		return noteOptions{}, errors.New("--template is only valid for create/template")
+	}
 	if opts.ArchivedOnly {
 		opts.IncludeArchived = true
 	}
@@ -1022,6 +1154,16 @@ func parseFilterOptions(args []string) (noteOptions, error) {
 }
 
 func validateMutationOptions(opts noteOptions) error {
+	if opts.IncludeArchived || opts.ArchivedOnly {
+		return errors.New("--include-archived and --archived-only are only valid for list/search")
+	}
+	if opts.Template != "" {
+		return errors.New("--template is only valid for create/template")
+	}
+	return nil
+}
+
+func validateCreateOptions(opts noteOptions) error {
 	if opts.IncludeArchived || opts.ArchivedOnly {
 		return errors.New("--include-archived and --archived-only are only valid for list/search")
 	}
@@ -1035,6 +1177,9 @@ func parseSearchOptions(args []string) (noteOptions, error) {
 	}
 	if opts.ClearTags {
 		return noteOptions{}, errors.New("--clear-tags is only valid for create/edit")
+	}
+	if opts.Template != "" {
+		return noteOptions{}, errors.New("--template is only valid for create/template")
 	}
 	if opts.ArchivedOnly {
 		opts.IncludeArchived = true
@@ -1107,6 +1252,93 @@ func formatTags(tags []string) string {
 	return strings.Join(tags, ",")
 }
 
+func builtInTemplates() map[string]noteTemplate {
+	return map[string]noteTemplate{
+		"daily": {
+			Name:         "daily",
+			Description:  "Daily log with priorities, notes, and follow-up prompts",
+			DefaultTitle: defaultDailyTitle,
+			DefaultTags:  []string{"daily"},
+			Body: func(title string) string {
+				return strings.Join([]string{
+					"## Top of Mind",
+					"",
+					"## Priorities",
+					"- [ ]",
+					"",
+					"## Notes",
+					"",
+					"## Wins",
+					"",
+					"## Tomorrow",
+				}, "\n")
+			},
+		},
+		"meeting": {
+			Name:         "meeting",
+			Description:  "Meeting notes with agenda, attendees, notes, and action items",
+			DefaultTitle: func() string { return "Meeting " + now().Format("2006-01-02") },
+			DefaultTags:  []string{"meeting"},
+			Body: func(title string) string {
+				return strings.Join([]string{
+					"## Details",
+					"- Date: " + now().Format("2006-01-02"),
+					"- Attendees:",
+					"- Agenda:",
+					"",
+					"## Notes",
+					"",
+					"## Decisions",
+					"",
+					"## Action Items",
+					"- [ ]",
+				}, "\n")
+			},
+		},
+		"project": {
+			Name:         "project",
+			Description:  "Project brief with goals, milestones, links, and next actions",
+			DefaultTitle: func() string { return "Project " + now().Format("2006-01-02") },
+			DefaultTags:  []string{"project"},
+			Body: func(title string) string {
+				return strings.Join([]string{
+					"## Summary",
+					"",
+					"## Goals",
+					"- [ ]",
+					"",
+					"## Milestones",
+					"- [ ]",
+					"",
+					"## Links",
+					"- [[ ]]",
+					"",
+					"## Next Actions",
+					"- [ ]",
+				}, "\n")
+			},
+		},
+	}
+}
+
+func defaultDailyTitle() string {
+	return now().Format("2006-01-02")
+}
+
+func printTemplates() {
+	names := make([]string, 0, len(builtInTemplates()))
+	for name := range builtInTemplates() {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	fmt.Println("Available templates:")
+	for _, name := range names {
+		template := builtInTemplates()[name]
+		fmt.Printf("  %s\t%s\n", template.Name, template.Description)
+	}
+}
+
 func validateRenameID(id string) error {
 	if id == "" {
 		return errors.New("new id cannot be empty")
@@ -1125,6 +1357,8 @@ func printUsage() {
 	fmt.Println("")
 	fmt.Println("Commands:")
 	fmt.Println("  create <title> [content] [--tag <tag>] [--tags a,b]  Create a Markdown note")
+	fmt.Println("  create [<title>] [content] --template <name>         Create a note from a built-in template")
+	fmt.Println("  template [list|<name> [<title>] [content]]           List templates or create from one directly")
 	fmt.Println("  edit <id> [content] [--tag <tag>] [--tags a,b]       Replace note body/tags or open in $EDITOR")
 	fmt.Println("  archive <id>                Mark a note as archived")
 	fmt.Println("  unarchive <id>              Remove archived status from a note")

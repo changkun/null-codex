@@ -1,0 +1,3 @@
+{
+  "result": "Add reusable note templates, starting with built-in `daily`, `meeting`, and `project` templates plus a `template`/`create --template` workflow, so the CLI moves from plain note storage to faster structured capture."
+}
