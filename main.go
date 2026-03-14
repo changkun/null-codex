@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"html"
 	"html/template"
+	"io"
 	"io/fs"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,6 +26,7 @@ import (
 
 const (
 	notesDir        = "notes"
+	noteAttachmentDir = ".attachments"
 	noteHistoryDir  = ".history"
 	noteTemplateDir = "templates"
 	inboxNoteID     = "inbox"
@@ -30,6 +34,8 @@ const (
 )
 
 var noteLinkPattern = regexp.MustCompile(`\[\[([^\[\]]+)\]\]`)
+var markdownImagePattern = regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
+var markdownLinkPattern = regexp.MustCompile(`\[(.*?)\]\(([^)]+)\)`)
 var inlineCodePattern = regexp.MustCompile("`([^`]+)`")
 var boldPattern = regexp.MustCompile(`\*\*([^*]+)\*\*`)
 var italicPattern = regexp.MustCompile(`\*([^*]+)\*`)
@@ -48,8 +54,15 @@ type noteContent struct {
 	Title    string
 	Tags     []string
 	Archived bool
+	Attachments []noteAttachment
 	BodyLine int
 	Body     string
+}
+
+type noteAttachment struct {
+	Name       string
+	StoredName string
+	MediaType  string
 }
 
 type searchResult struct {
@@ -171,11 +184,19 @@ type webNoteDetail struct {
 	Tags              []string
 	Archived          bool
 	ModTime           string
+	Attachments       []webAttachment
 	RenderedBody      template.HTML
 	OutgoingLinks     []webLink
 	Backlinks         []webLink
 	BrokenLinks       []string
 	OutgoingLinksText string
+}
+
+type webAttachment struct {
+	Name      string
+	MediaType string
+	URL       string
+	IsImage   bool
 }
 
 type webNoteVersion struct {
@@ -212,6 +233,7 @@ type webNoteForm struct {
 	Tags        string
 	Body        string
 	Archived    bool
+	Attachments []webAttachment
 	ActionURL   string
 	CancelURL   string
 	SubmitLabel string
@@ -298,6 +320,8 @@ func run(args []string) error {
 		return templateNote(args[1:])
 	case "edit":
 		return editNote(args[1:])
+	case "attach":
+		return attachNoteFiles(args[1:])
 	case "history":
 		return historyNote(args[1:])
 	case "list", "ls":
@@ -725,6 +749,50 @@ func editNote(args []string) error {
 	return nil
 }
 
+func attachNoteFiles(args []string) error {
+	if len(args) < 2 {
+		return errors.New("attach requires a note id and at least one file")
+	}
+
+	id := strings.TrimSpace(args[0])
+	embed := false
+	var paths []string
+	for _, arg := range args[1:] {
+		switch arg {
+		case "--embed":
+			embed = true
+		default:
+			paths = append(paths, arg)
+		}
+	}
+	if len(paths) == 0 {
+		return errors.New("attach requires at least one file")
+	}
+	if _, err := os.Stat(notePath(id)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("note %q not found", id)
+		}
+		return err
+	}
+
+	content, err := readNoteContent(notePath(id))
+	if err != nil {
+		return err
+	}
+	added, body, err := addNoteAttachments(id, content.Attachments, content.Body, paths, embed)
+	if err != nil {
+		return err
+	}
+	content.Attachments = added
+	content.Body = body
+	if err := writeNoteVersioned(id, "attach", []byte(formatNote(content))); err != nil {
+		return err
+	}
+
+	fmt.Printf("attached %d file(s) to %s\n", len(paths), id)
+	return nil
+}
+
 func viewNote(args []string) error {
 	if len(args) != 1 {
 		return errors.New("view requires a note id")
@@ -951,6 +1019,7 @@ func newServeMux(server *notebookServer) http.Handler {
 	mux.HandleFunc("/tasks/toggle", server.serveToggleTask)
 	mux.HandleFunc("/tasks", server.serveTasksPage)
 	mux.HandleFunc("/new", server.serveCreateNotePage)
+	mux.HandleFunc("/attachments/", server.serveAttachment)
 	mux.HandleFunc("/notes", server.serveCreateNote)
 	mux.HandleFunc("/notes/", server.serveNotePage)
 	return mux
@@ -1277,6 +1346,10 @@ func (s *notebookServer) serveCreateNote(w http.ResponseWriter, r *http.Request)
 func (s *notebookServer) serveNotePage(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/notes/")
 	path = strings.TrimSpace(strings.Trim(path, "/"))
+	isAttachmentUploadRoute := strings.HasSuffix(path, "/attachments")
+	if isAttachmentUploadRoute {
+		path = strings.TrimSpace(strings.TrimSuffix(path, "/attachments"))
+	}
 	isHistoryRestoreRoute := strings.HasSuffix(path, "/history/restore")
 	if isHistoryRestoreRoute {
 		path = strings.TrimSpace(strings.TrimSuffix(path, "/history/restore"))
@@ -1301,6 +1374,14 @@ func (s *notebookServer) serveNotePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if isAttachmentUploadRoute {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		s.serveAttachNote(w, r, id)
+		return
+	}
 	if isEditRoute {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1365,6 +1446,51 @@ func (s *notebookServer) serveNotePage(w http.ResponseWriter, r *http.Request) {
 		LiveReload:      s.watch,
 	}
 	renderNotebookPage(w, data)
+}
+
+func (s *notebookServer) serveAttachment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/attachments/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+	id, err := url.PathUnescape(parts[0])
+	if err != nil || id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	storedName, err := url.PathUnescape(parts[1])
+	if err != nil || storedName == "" || strings.Contains(storedName, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	content, err := readNoteContent(notePath(id))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	var attachment noteAttachment
+	found := false
+	for _, candidate := range content.Attachments {
+		if candidate.StoredName == storedName {
+			attachment = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", attachment.MediaType)
+	http.ServeFile(w, r, noteAttachmentPath(id, storedName))
 }
 
 func renderNotebookPage(w http.ResponseWriter, data notebookPageData) {
@@ -1464,6 +1590,7 @@ func (s *notebookServer) serveEditNotePage(w http.ResponseWriter, r *http.Reques
 			Tags:        strings.Join(content.Tags, ", "),
 			Body:        content.Body,
 			Archived:    content.Archived,
+			Attachments: buildWebAttachments(id, content.Attachments),
 			ActionURL:   noteURL(id),
 			CancelURL:   noteURL(id),
 			SubmitLabel: "Save changes",
@@ -1500,6 +1627,54 @@ func (s *notebookServer) serveUpdateNote(w http.ResponseWriter, r *http.Request,
 	}
 
 	http.Redirect(w, r, noteURL(id), http.StatusSeeOther)
+}
+
+func (s *notebookServer) serveAttachNote(w http.ResponseWriter, r *http.Request, id string) {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if _, err := os.Stat(notePath(id)); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	embed := r.FormValue("embed") != ""
+	files := r.MultipartForm.File["attachment"]
+	if len(files) == 0 {
+		http.Error(w, "missing attachment file", http.StatusBadRequest)
+		return
+	}
+
+	content, err := readNoteContent(notePath(id))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	paths, cleanup, err := materializeMultipartFiles(files)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer cleanup()
+
+	attachments, body, err := addNoteAttachments(id, content.Attachments, content.Body, paths, embed)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	content.Attachments = attachments
+	content.Body = body
+	if err := writeNoteVersioned(id, "attach", []byte(formatNote(content))); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := s.refresh(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, safeReturnURL(r.FormValue("return_to"), noteURL(id)), http.StatusSeeOther)
 }
 
 func (s *notebookServer) serveRestoreNote(w http.ResponseWriter, r *http.Request, id string) {
@@ -1739,6 +1914,9 @@ func renameNote(args []string) error {
 		if moveErr := moveHistory(newID, oldID); moveErr != nil {
 			return fmt.Errorf("%v (history rollback failed: %v)", cause, moveErr)
 		}
+		if moveErr := moveAttachmentDir(newID, oldID); moveErr != nil {
+			return fmt.Errorf("%v (attachment rollback failed: %v)", cause, moveErr)
+		}
 		return cause
 	}
 
@@ -1750,6 +1928,9 @@ func renameNote(args []string) error {
 			return fmt.Errorf("move history after rename: %v (rollback failed: %v)", err, rollbackErr)
 		}
 		return err
+	}
+	if err := moveAttachmentDir(oldID, newID); err != nil {
+		return rollbackRename(fmt.Errorf("move attachments after rename: %w", err))
 	}
 	oldData, err := os.ReadFile(newPath)
 	if err != nil {
@@ -1998,8 +2179,9 @@ func readNoteContent(path string) (noteContent, error) {
 func parseNoteContent(path, data string) noteContent {
 	lines := strings.Split(data, "\n")
 	content := noteContent{
-		Title:    strings.TrimSuffix(filepath.Base(path), ".md"),
-		BodyLine: 1,
+		Title:       strings.TrimSuffix(filepath.Base(path), ".md"),
+		Attachments: nil,
+		BodyLine:    1,
 	}
 
 	bodyStart := 0
@@ -2029,6 +2211,11 @@ func parseNoteContent(path, data string) noteContent {
 			case strings.HasPrefix(lower, "archived:"):
 				content.Archived = strings.EqualFold(strings.TrimSpace(line[9:]), "true")
 				bodyStart++
+			case strings.HasPrefix(lower, "attachment:"):
+				if attachment, ok := parseAttachmentLine(line); ok {
+					content.Attachments = append(content.Attachments, attachment)
+				}
+				bodyStart++
 			default:
 				goto body
 			}
@@ -2043,6 +2230,195 @@ body:
 	content.Body = strings.TrimRight(strings.Join(lines[bodyStart:], "\n"), "\n")
 
 	return content
+}
+
+func parseAttachmentLine(line string) (noteAttachment, bool) {
+	value := strings.TrimSpace(line[len("Attachment:"):])
+	parts := strings.Split(value, "|")
+	if len(parts) != 3 {
+		return noteAttachment{}, false
+	}
+	attachment := noteAttachment{
+		StoredName: strings.TrimSpace(parts[0]),
+		Name:       strings.TrimSpace(parts[1]),
+		MediaType:  strings.TrimSpace(parts[2]),
+	}
+	if attachment.StoredName == "" || attachment.Name == "" || attachment.MediaType == "" {
+		return noteAttachment{}, false
+	}
+	return attachment, true
+}
+
+func addNoteAttachments(id string, existing []noteAttachment, body string, paths []string, embed bool) ([]noteAttachment, string, error) {
+	attachments := append([]noteAttachment(nil), existing...)
+	if err := os.MkdirAll(noteAttachmentsDir(id), 0o755); err != nil {
+		return nil, "", err
+	}
+
+	for _, sourcePath := range paths {
+		attachment, err := copyAttachmentFile(id, strings.TrimSpace(sourcePath))
+		if err != nil {
+			return nil, "", err
+		}
+		attachments = append(attachments, attachment)
+		if embed && attachment.IsImage() {
+			body = appendEmbeddedAttachment(body, id, attachment)
+		}
+	}
+	return attachments, body, nil
+}
+
+func copyAttachmentFile(id, sourcePath string) (noteAttachment, error) {
+	if sourcePath == "" {
+		return noteAttachment{}, errors.New("attachment path cannot be empty")
+	}
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return noteAttachment{}, err
+	}
+	if info.IsDir() {
+		return noteAttachment{}, fmt.Errorf("attachment %q is a directory", sourcePath)
+	}
+
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return noteAttachment{}, err
+	}
+	defer source.Close()
+
+	originalName := filepath.Base(sourcePath)
+	storedName := uniqueAttachmentStoredName(id, originalName)
+	targetPath := noteAttachmentPath(id, storedName)
+	target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return noteAttachment{}, err
+	}
+	defer target.Close()
+
+	if _, err := io.Copy(target, source); err != nil {
+		_ = os.Remove(targetPath)
+		return noteAttachment{}, err
+	}
+
+	return noteAttachment{
+		Name:       originalName,
+		StoredName: storedName,
+		MediaType:  detectAttachmentMediaType(originalName),
+	}, nil
+}
+
+func uniqueAttachmentStoredName(id, originalName string) string {
+	clean := sanitizeAttachmentName(originalName)
+	if clean == "" {
+		clean = "attachment"
+	}
+	ext := filepath.Ext(clean)
+	base := strings.TrimSuffix(clean, ext)
+	candidate := clean
+	for i := 1; ; i++ {
+		if _, err := os.Stat(noteAttachmentPath(id, candidate)); errors.Is(err, fs.ErrNotExist) {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d%s", base, i, ext)
+	}
+}
+
+func sanitizeAttachmentName(name string) string {
+	name = strings.TrimSpace(filepath.Base(name))
+	name = strings.ReplaceAll(name, " ", "-")
+	name = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case strings.ContainsRune("._-", r):
+			return r
+		default:
+			return '-'
+		}
+	}, name)
+	name = strings.Trim(name, ".-")
+	return name
+}
+
+func detectAttachmentMediaType(name string) string {
+	if mediaType := mime.TypeByExtension(strings.ToLower(filepath.Ext(name))); mediaType != "" {
+		return mediaType
+	}
+	return "application/octet-stream"
+}
+
+func appendEmbeddedAttachment(body, id string, attachment noteAttachment) string {
+	embed := fmt.Sprintf("![%s](%s)", attachment.Name, attachmentMarkdownPath(id, attachment.StoredName))
+	body = strings.TrimRight(body, "\n")
+	if body == "" {
+		return embed
+	}
+	return body + "\n\n" + embed
+}
+
+func attachmentMarkdownPath(id, storedName string) string {
+	return filepath.ToSlash(filepath.Join(noteAttachmentDir, id, storedName))
+}
+
+func (a noteAttachment) IsImage() bool {
+	return strings.HasPrefix(strings.ToLower(a.MediaType), "image/")
+}
+
+func materializeMultipartFiles(files []*multipart.FileHeader) ([]string, func(), error) {
+	tempDir, err := os.MkdirTemp("", "note-attachments-*")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cleanup := func() {
+		_ = os.RemoveAll(tempDir)
+	}
+	var paths []string
+	for _, fileHeader := range files {
+		source, err := fileHeader.Open()
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+
+		name := sanitizeAttachmentName(fileHeader.Filename)
+		if name == "" {
+			name = "attachment"
+		}
+		targetPath := filepath.Join(tempDir, uniqueLocalAttachmentName(tempDir, name))
+		target, err := os.OpenFile(targetPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			source.Close()
+			cleanup()
+			return nil, nil, err
+		}
+		if _, err := io.Copy(target, source); err != nil {
+			target.Close()
+			source.Close()
+			cleanup()
+			return nil, nil, err
+		}
+		target.Close()
+		source.Close()
+		paths = append(paths, targetPath)
+	}
+	return paths, cleanup, nil
+}
+
+func uniqueLocalAttachmentName(dir, name string) string {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	candidate := name
+	for i := 1; ; i++ {
+		if _, err := os.Stat(filepath.Join(dir, candidate)); errors.Is(err, fs.ErrNotExist) {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d%s", base, i, ext)
+	}
 }
 
 func loadNotes() ([]noteMeta, error) {
@@ -2091,6 +2467,18 @@ func notePath(id string) string {
 	return filepath.Join(notesDir, id+".md")
 }
 
+func attachmentsRoot() string {
+	return filepath.Join(notesDir, noteAttachmentDir)
+}
+
+func noteAttachmentsDir(id string) string {
+	return filepath.Join(attachmentsRoot(), id)
+}
+
+func noteAttachmentPath(id, storedName string) string {
+	return filepath.Join(noteAttachmentsDir(id), storedName)
+}
+
 func customTemplateDir() string {
 	return filepath.Join(notesDir, noteTemplateDir)
 }
@@ -2116,6 +2504,9 @@ func formatNote(note noteContent) string {
 	}
 	if note.Archived {
 		b.WriteString("Archived: true\n")
+	}
+	for _, attachment := range note.Attachments {
+		fmt.Fprintf(&b, "Attachment: %s | %s | %s\n", attachment.StoredName, attachment.Name, attachment.MediaType)
 	}
 	b.WriteString("\n")
 	if note.Body != "" {
@@ -2385,7 +2776,8 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 			Tags:              append([]string(nil), note.Tags...),
 			Archived:          note.Archived,
 			ModTime:           note.ModTime.Format(time.RFC3339),
-			RenderedBody:      renderMarkdownHTML(content, existing, &taskRenderOptions{NoteID: note.ID, ReturnURL: noteURL(note.ID)}),
+			Attachments:       buildWebAttachments(note.ID, content.Attachments),
+			RenderedBody:      renderMarkdownHTML(note.ID, content, existing, &taskRenderOptions{NoteID: note.ID, ReturnURL: noteURL(note.ID)}),
 			OutgoingLinks:     outgoing,
 			Backlinks:         currentBacklinks,
 			BrokenLinks:       broken,
@@ -2446,6 +2838,19 @@ func buildOutgoingLinks(links []string, notes []noteMeta) []webLink {
 		})
 	}
 	return outgoing
+}
+
+func buildWebAttachments(id string, attachments []noteAttachment) []webAttachment {
+	items := make([]webAttachment, 0, len(attachments))
+	for _, attachment := range attachments {
+		items = append(items, webAttachment{
+			Name:      attachment.Name,
+			MediaType: attachment.MediaType,
+			URL:       attachmentURL(id, attachment.StoredName),
+			IsImage:   attachment.IsImage(),
+		})
+	}
+	return items
 }
 
 func collectBrokenTargets(links []string, existing map[string]struct{}) []string {
@@ -2544,6 +2949,14 @@ func noteURL(id string) string {
 
 func noteHistoryURL(id string) string {
 	return noteURL(id) + "/history"
+}
+
+func noteAttachmentsURL(id string) string {
+	return noteURL(id) + "/attachments"
+}
+
+func attachmentURL(id, storedName string) string {
+	return "/attachments/" + url.PathEscape(id) + "/" + url.PathEscape(storedName)
 }
 
 func noteHistoryVersionURL(id, versionID string) string {
@@ -3489,6 +3902,26 @@ func moveHistory(oldID, newID string) error {
 	return os.Rename(oldHistory, newHistory)
 }
 
+func moveAttachmentDir(oldID, newID string) error {
+	oldDir := noteAttachmentsDir(oldID)
+	if _, err := os.Stat(oldDir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	newDir := noteAttachmentsDir(newID)
+	if _, err := os.Stat(newDir); err == nil {
+		return fmt.Errorf("attachments for %q already exist", newID)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(newDir), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(oldDir, newDir)
+}
+
 func historyPath(id string) string {
 	return filepath.Join(notesDir, noteHistoryDir, id)
 }
@@ -3577,7 +4010,7 @@ func diffOperations(a, b []string) []diffOp {
 	return ops
 }
 
-func renderMarkdownHTML(content noteContent, existing map[string]struct{}, tasks *taskRenderOptions) template.HTML {
+func renderMarkdownHTML(noteID string, content noteContent, existing map[string]struct{}, tasks *taskRenderOptions) template.HTML {
 	lines := strings.Split(content.Body, "\n")
 	var b strings.Builder
 	inList := false
@@ -3617,17 +4050,17 @@ func renderMarkdownHTML(content noteContent, existing map[string]struct{}, tasks
 
 		if strings.HasPrefix(trimmed, "### ") {
 			closeList()
-			b.WriteString("<h3>" + renderInlineMarkdown(strings.TrimSpace(trimmed[4:]), existing) + "</h3>")
+			b.WriteString("<h3>" + renderInlineMarkdown(noteID, strings.TrimSpace(trimmed[4:]), existing) + "</h3>")
 			continue
 		}
 		if strings.HasPrefix(trimmed, "## ") {
 			closeList()
-			b.WriteString("<h2>" + renderInlineMarkdown(strings.TrimSpace(trimmed[3:]), existing) + "</h2>")
+			b.WriteString("<h2>" + renderInlineMarkdown(noteID, strings.TrimSpace(trimmed[3:]), existing) + "</h2>")
 			continue
 		}
 		if strings.HasPrefix(trimmed, "# ") {
 			closeList()
-			b.WriteString("<h1>" + renderInlineMarkdown(strings.TrimSpace(trimmed[2:]), existing) + "</h1>")
+			b.WriteString("<h1>" + renderInlineMarkdown(noteID, strings.TrimSpace(trimmed[2:]), existing) + "</h1>")
 			continue
 		}
 
@@ -3636,12 +4069,12 @@ func renderMarkdownHTML(content noteContent, existing map[string]struct{}, tasks
 				b.WriteString("<ul>")
 				inList = true
 			}
-			b.WriteString("<li>" + renderListItemMarkdown(strings.TrimSpace(trimmed[2:]), existing, tasks, lineNo) + "</li>")
+			b.WriteString("<li>" + renderListItemMarkdown(noteID, strings.TrimSpace(trimmed[2:]), existing, tasks, lineNo) + "</li>")
 			continue
 		}
 
 		closeList()
-		b.WriteString("<p>" + renderInlineMarkdown(trimmed, existing) + "</p>")
+		b.WriteString("<p>" + renderInlineMarkdown(noteID, trimmed, existing) + "</p>")
 	}
 
 	closeList()
@@ -3651,17 +4084,17 @@ func renderMarkdownHTML(content noteContent, existing map[string]struct{}, tasks
 	return template.HTML(b.String())
 }
 
-func renderListItemMarkdown(text string, existing map[string]struct{}, tasks *taskRenderOptions, line int) string {
+func renderListItemMarkdown(noteID, text string, existing map[string]struct{}, tasks *taskRenderOptions, line int) string {
 	task, ok := parseTaskLine(text)
 	if !ok {
-		return renderInlineMarkdown(text, existing)
+		return renderInlineMarkdown(noteID, text, existing)
 	}
 
 	checked := ""
 	if !task.Open {
 		checked = " checked"
 	}
-	body := renderInlineMarkdown(task.Text, existing)
+	body := renderInlineMarkdown(noteID, task.Text, existing)
 	if tasks == nil || tasks.NoteID == "" {
 		return `<label class="task-item"><input type="checkbox" disabled` + checked + `><span>` + body + `</span></label>`
 	}
@@ -3674,13 +4107,51 @@ func renderListItemMarkdown(text string, existing map[string]struct{}, tasks *ta
 		`</form>`
 }
 
-func renderInlineMarkdown(text string, existing map[string]struct{}) string {
+func renderInlineMarkdown(noteID, text string, existing map[string]struct{}) string {
 	text = html.EscapeString(text)
+	text = renderMarkdownImages(noteID, text)
+	text = renderMarkdownLinks(text)
 	text = renderWikiLinks(text, existing)
 	text = inlineCodePattern.ReplaceAllString(text, "<code>$1</code>")
 	text = boldPattern.ReplaceAllString(text, "<strong>$1</strong>")
 	text = italicPattern.ReplaceAllString(text, "<em>$1</em>")
 	return text
+}
+
+func renderMarkdownImages(noteID, text string) string {
+	return markdownImagePattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := markdownImagePattern.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+		alt := parts[1]
+		src := resolveAttachmentSrc(noteID, html.UnescapeString(parts[2]))
+		return `<img src="` + html.EscapeString(src) + `" alt="` + alt + `">`
+	})
+}
+
+func renderMarkdownLinks(text string) string {
+	return markdownLinkPattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := markdownLinkPattern.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match
+		}
+		label := parts[1]
+		href := html.UnescapeString(parts[2])
+		if strings.HasPrefix(href, "javascript:") {
+			return label
+		}
+		return `<a href="` + html.EscapeString(href) + `">` + label + `</a>`
+	})
+}
+
+func resolveAttachmentSrc(noteID, raw string) string {
+	raw = strings.TrimSpace(raw)
+	prefix := filepath.ToSlash(noteAttachmentDir + "/" + noteID + "/")
+	if strings.HasPrefix(raw, prefix) {
+		return attachmentURL(noteID, strings.TrimPrefix(raw, prefix))
+	}
+	return raw
 }
 
 func openTasksFromBody(body string) []noteTask {
@@ -3797,6 +4268,7 @@ func renderWikiLinks(text string, existing map[string]struct{}) string {
 
 func notebookPageTemplate() *template.Template {
 	return template.Must(template.New("notebook").Funcs(template.FuncMap{
+		"noteURL":        noteURL,
 		"noteEditURL":    noteEditURL,
 		"noteHistoryURL": noteHistoryURL,
 	}).Parse(`<!doctype html>
@@ -3860,6 +4332,10 @@ func notebookPageTemplate() *template.Template {
     .task-item { display:flex; align-items:flex-start; gap:0.6rem; }
     .task-item input { margin-top:0.2rem; }
     .task-item-toggle { cursor:pointer; }
+    .attachments { display:grid; gap:0.75rem; margin-top:1rem; }
+    .attachment-item { display:flex; justify-content:space-between; gap:1rem; align-items:center; padding:0.8rem 0.9rem; border:1px solid var(--line); border-radius:14px; background:#fff; }
+    .attachment-preview { max-width:100%; border-radius:12px; border:1px solid var(--line); margin-top:0.75rem; }
+    .upload-form { display:grid; gap:0.8rem; margin-top:1rem; }
     .form-actions { display:flex; gap:0.75rem; flex-wrap:wrap; }
     .history-layout { display:grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap:1rem; align-items:start; }
     .history-list { display:grid; gap:0.75rem; }
@@ -3972,11 +4448,27 @@ func notebookPageTemplate() *template.Template {
             <div class="field">
               <label for="body">Markdown</label>
               <textarea id="body" name="body">{{.NoteForm.Body}}</textarea>
+              <div class="hint">Image embeds use standard Markdown like <code>![alt](.attachments/note-id/file.png)</code>.</div>
             </div>
             <label class="checkbox" for="archived">
               <input id="archived" name="archived" type="checkbox" value="1" {{if .NoteForm.Archived}}checked{{end}}>
               <span>Archived</span>
             </label>
+            {{if .NoteForm.Attachments}}
+              <div class="section">
+                <h2>Attachments</h2>
+                <div class="attachments">
+                  {{range .NoteForm.Attachments}}
+                    <div class="attachment-item">
+                      <div>
+                        <strong><a href="{{.URL}}">{{.Name}}</a></strong>
+                        <div class="meta">{{.MediaType}}</div>
+                      </div>
+                    </div>
+                  {{end}}
+                </div>
+              </div>
+            {{end}}
             <div class="form-actions">
               <button class="button" type="submit">{{.NoteForm.SubmitLabel}}</button>
               <a class="button secondary" href="{{.NoteForm.CancelURL}}">Cancel</a>
@@ -4060,6 +4552,38 @@ func notebookPageTemplate() *template.Template {
             </div>
           {{end}}
           <div class="section">{{.CurrentNote.RenderedBody}}</div>
+          <div class="section">
+            <h2>Attachments</h2>
+            {{if .CurrentNote.Attachments}}
+              <div class="attachments">
+                {{range .CurrentNote.Attachments}}
+                  <div class="attachment-item">
+                    <div>
+                      <strong><a href="{{.URL}}">{{.Name}}</a></strong>
+                      <div class="meta">{{.MediaType}}</div>
+                      {{if .IsImage}}<img class="attachment-preview" src="{{.URL}}" alt="{{.Name}}">{{end}}
+                    </div>
+                  </div>
+                {{end}}
+              </div>
+            {{else}}
+              <div class="empty">No attachments yet.</div>
+            {{end}}
+            <form class="upload-form" method="post" action="{{noteURL .CurrentNote.ID}}/attachments" enctype="multipart/form-data">
+              <input type="hidden" name="return_to" value="{{noteURL .CurrentNote.ID}}">
+              <div class="field">
+                <label for="attachment">Add files</label>
+                <input id="attachment" name="attachment" type="file" multiple required>
+              </div>
+              <label class="checkbox" for="embed">
+                <input id="embed" name="embed" type="checkbox" value="1">
+                <span>Append Markdown image embeds for uploaded images</span>
+              </label>
+              <div class="form-actions">
+                <button class="button" type="submit">Upload attachments</button>
+              </div>
+            </form>
+          </div>
           <div class="section">
             <h2>Outgoing Links</h2>
             {{if .CurrentNote.OutgoingLinks}}
@@ -4354,6 +4878,7 @@ func printUsage() {
 	fmt.Println("  create [<title>] [content] --template <name>         Create a note from a built-in or disk template")
 	fmt.Println("  template [list|<name> [<title>] [content]]           List templates or create from one directly")
 	fmt.Println("  edit <id> [content] [--tag <tag>] [--tags a,b]       Replace note body/tags or open in $EDITOR")
+	fmt.Println("  attach <id> <file>... [--embed]  Copy files into a note and optionally embed uploaded images")
 	fmt.Println("  history <id> [version]       List saved versions or diff one against the current note")
 	fmt.Println("  archive <id>                Mark a note as archived")
 	fmt.Println("  unarchive <id>              Remove archived status from a note")

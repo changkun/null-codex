@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1929,7 +1930,7 @@ func TestRenderMarkdownHTMLLinksExistingAndBrokenNotes(t *testing.T) {
 		"target": {},
 	}
 
-	got := string(renderMarkdownHTML(noteContent{Body: "See [[target]] and [[missing]].", BodyLine: 1}, existing, nil))
+	got := string(renderMarkdownHTML("", noteContent{Body: "See [[target]] and [[missing]].", BodyLine: 1}, existing, nil))
 
 	if !strings.Contains(got, `<a class="wiki-link" href="/notes/target">[[target]]</a>`) {
 		t.Fatalf("expected existing wiki link to render as anchor, got %q", got)
@@ -1940,7 +1941,7 @@ func TestRenderMarkdownHTMLLinksExistingAndBrokenNotes(t *testing.T) {
 }
 
 func TestRenderMarkdownHTMLRendersCheckboxItems(t *testing.T) {
-	got := string(renderMarkdownHTML(noteContent{Body: "- [ ] Open\n- [x] Done", BodyLine: 1}, nil, nil))
+	got := string(renderMarkdownHTML("", noteContent{Body: "- [ ] Open\n- [x] Done", BodyLine: 1}, nil, nil))
 
 	if !strings.Contains(got, `<label class="task-item"><input type="checkbox" disabled><span>Open</span></label>`) {
 		t.Fatalf("expected open checkbox item, got %q", got)
@@ -1952,6 +1953,7 @@ func TestRenderMarkdownHTMLRendersCheckboxItems(t *testing.T) {
 
 func TestRenderMarkdownHTMLRendersToggleFormsWhenTaskContextPresent(t *testing.T) {
 	got := string(renderMarkdownHTML(
+		"project",
 		noteContent{Body: "- [ ] Open", BodyLine: 4},
 		nil,
 		&taskRenderOptions{NoteID: "project", ReturnURL: "/notes/project"},
@@ -1965,6 +1967,67 @@ func TestRenderMarkdownHTMLRendersToggleFormsWhenTaskContextPresent(t *testing.T
 	}
 	if strings.Contains(got, `disabled`) {
 		t.Fatalf("expected interactive checkbox, got %q", got)
+	}
+}
+
+func TestParseNoteContentReadsAttachments(t *testing.T) {
+	got := parseNoteContent(notePath("project"), "# Project\nAttachment: diagram.png | Architecture Diagram.png | image/png\nAttachment: spec.pdf | Spec.pdf | application/pdf\n\nBody\n")
+
+	if len(got.Attachments) != 2 {
+		t.Fatalf("expected attachments, got %#v", got.Attachments)
+	}
+	if got.Attachments[0].StoredName != "diagram.png" || got.Attachments[1].MediaType != "application/pdf" {
+		t.Fatalf("unexpected attachments: %#v", got.Attachments)
+	}
+}
+
+func TestAttachNoteFilesCopiesFilesAndEmbedsImages(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("project"), []byte("# Project\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	imagePath := filepath.Join(t.TempDir(), "diagram.png")
+	if err := os.WriteFile(imagePath, []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := attachNoteFiles([]string{"project", imagePath, "--embed"}); err != nil {
+			t.Fatalf("attachNoteFiles returned error: %v", err)
+		}
+	})
+
+	if output != "attached 1 file(s) to project\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+	content, err := readNoteContent(notePath("project"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(content.Attachments) != 1 {
+		t.Fatalf("expected stored attachment, got %#v", content.Attachments)
+	}
+	if !strings.Contains(content.Body, "![diagram.png](.attachments/project/diagram.png)") {
+		t.Fatalf("expected embedded image markdown, got %q", content.Body)
+	}
+	if _, err := os.Stat(noteAttachmentPath("project", "diagram.png")); err != nil {
+		t.Fatalf("expected copied attachment, got %v", err)
+	}
+}
+
+func TestRenderMarkdownHTMLRendersAttachedImages(t *testing.T) {
+	got := string(renderMarkdownHTML("project", noteContent{
+		Body:     "![Diagram](.attachments/project/diagram.png)",
+		BodyLine: 1,
+	}, nil, nil))
+
+	if !strings.Contains(got, `<img src="/attachments/project/diagram.png" alt="Diagram">`) {
+		t.Fatalf("expected attachment image rendering, got %q", got)
 	}
 }
 
@@ -2636,6 +2699,85 @@ func TestServeEditNotePageRendersExistingContent(t *testing.T) {
 	}
 	if !strings.Contains(body, `name="archived" type="checkbox" value="1" checked`) {
 		t.Fatalf("expected archived checkbox to be checked, got %q", body)
+	}
+}
+
+func TestServeAttachNotePostUploadsAndEmbedsImage(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\n\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	fileWriter, err := writer.CreateFormFile("attachment", "diagram.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(fileWriter, "png"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("embed", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("return_to", "/notes/alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/notes/alpha/attachments", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+
+	newTestServeMux(t).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	content, err := readNoteContent(notePath("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(content.Attachments) != 1 {
+		t.Fatalf("expected stored attachment, got %#v", content.Attachments)
+	}
+	if !strings.Contains(content.Body, "![diagram.png](.attachments/alpha/diagram.png)") {
+		t.Fatalf("expected embedded markdown, got %q", content.Body)
+	}
+}
+
+func TestServeAttachmentServesUploadedFile(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(noteAttachmentsDir("alpha"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nAttachment: diagram.png | Diagram.png | image/png\n\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(noteAttachmentPath("alpha", "diagram.png"), []byte("png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/attachments/alpha/diagram.png", nil)
+	rec := httptest.NewRecorder()
+
+	newTestServeMux(t).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "image/png") {
+		t.Fatalf("unexpected content type: %q", got)
+	}
+	if rec.Body.String() != "png" {
+		t.Fatalf("unexpected body: %q", rec.Body.String())
 	}
 }
 

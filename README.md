@@ -12,6 +12,8 @@ go run . template
 go run . template project "Null Codex"
 go run . edit daily-log --tags work,review "Replaced the body from the CLI."
 go run . edit daily-log --clear-tags
+go run . attach daily-log ./architecture.png --embed
+go run . attach daily-log ./spec.pdf ./notes.txt
 go run . archive daily-log
 go run . unarchive daily-log
 go run . rename daily-log project-log
@@ -50,6 +52,7 @@ go run . sync
 - `create` writes a Markdown file with a heading based on the note title and optional normalized tags, or renders a built-in scaffold with `--template <name>`.
 - `template` lists built-in and disk-backed templates with no arguments, or creates a note directly from a template with `template <name> [title]`.
 - `edit` updates an existing note body and tags from the CLI, clears tags with `--clear-tags`, or opens the file in `$EDITOR`.
+- `attach` copies one or more files into `notes/.attachments/<note-id>/`, records them in note metadata, and appends Markdown image embeds when `--embed` is used with image files.
 - Every create, edit, archive toggle, rename rewrite, delete, browser edit, and editor-driven change stores a local snapshot under `notes/.history/<note-id>/`.
 - `history` lists saved note versions newest-first, or prints a diff between one saved version and the current note state when a version ID is supplied.
 - `archive` and `unarchive` toggle a note's archived status by updating note metadata in place.
@@ -65,7 +68,7 @@ go run . sync
 - `links` lists the note IDs referenced by `[[note-id]]` links in a note body.
 - `backlinks` lists the note IDs that link to the requested note.
 - `graph` emits the notebook's `[[note-id]]` link structure as Graphviz DOT, including dashed nodes for missing link targets.
-- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, surfaces a notebook-wide open task view at `/tasks`, supports toggling Markdown checkboxes from note pages and the task view, and supports creating and editing notes directly in the browser. Pass `--watch` to poll `notes/`, rebuild the link/task index automatically, and reload open browser views when files change on disk.
+- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, surfaces a notebook-wide open task view at `/tasks`, supports toggling Markdown checkboxes from note pages and the task view, supports creating and editing notes directly in the browser, and lets you upload note attachments with optional image embedding from note pages. Pass `--watch` to poll `notes/`, rebuild the link/task index automatically, and reload open browser views when files change on disk.
 - `delete` removes the note file from `notes/`.
 - `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets. `doctor --fix` creates stub notes for missing link targets, and `--report` lists each created stub note.
 - `sync` treats `notes/` as its own Git repository, stages notebook changes, creates a `sync notebook <timestamp>` commit when needed, then runs `git pull --rebase` and `git push` against the branch upstream configured for `notes/`.
@@ -96,6 +99,16 @@ Tags: shipped, work
 Archived: true
 
 Shipped the first version.
+```
+
+Attachments are stored as additional metadata lines and copied into `notes/.attachments/<note-id>/`:
+
+```md
+# Daily Log
+Attachment: architecture.png | Architecture Diagram.png | image/png
+Attachment: spec.pdf | Spec.pdf | application/pdf
+
+![Architecture Diagram.png](.attachments/daily-log/architecture.png)
 ```
 
 Built-in templates add reusable body scaffolds and default tags:
