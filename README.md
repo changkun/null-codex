@@ -41,8 +41,8 @@ go run . doctor --fix --report
 
 ## Behavior
 
-- `create` writes a Markdown file with a heading based on the note title and optional normalized tags, or renders a built-in scaffold with `--template daily|meeting|project`.
-- `template` lists built-in templates with no arguments, or creates a note directly from a template with `template <name> [title]`.
+- `create` writes a Markdown file with a heading based on the note title and optional normalized tags, or renders a built-in scaffold with `--template <name>`.
+- `template` lists built-in and disk-backed templates with no arguments, or creates a note directly from a template with `template <name> [title]`.
 - `edit` updates an existing note body and tags from the CLI, clears tags with `--clear-tags`, or opens the file in `$EDITOR`.
 - Every create, edit, archive toggle, rename rewrite, delete, browser edit, and editor-driven change stores a local snapshot under `notes/.history/<note-id>/`.
 - `history` lists saved note versions newest-first, or prints a diff between one saved version and the current note state when a version ID is supplied.
@@ -78,5 +78,7 @@ Built-in templates add reusable body scaffolds and default tags:
 - `daily`: top-of-mind, priorities, notes, wins, tomorrow
 - `meeting`: details, notes, decisions, action items
 - `project`: summary, goals, milestones, links, next actions
+
+Custom templates can be added as Markdown files under `notes/templates/<name>.md`. They use the normal note format, so the file title becomes the default note title, `Tags:` become default tags, and the remaining body becomes the template body.
 
 Version IDs are filesystem-local snapshots with a UTC timestamp, sequence number, and action suffix, for example `20260314T090000.000000000Z-0001-edit`.

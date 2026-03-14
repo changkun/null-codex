@@ -1,0 +1,3 @@
+{
+  "result": "Add support for user-defined note templates loaded from disk, so `create --template` and `template <name>` work with custom templates in addition to the built-in `daily`, `meeting`, and `project` presets."
+}

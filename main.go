@@ -20,6 +20,7 @@ import (
 
 const notesDir = "notes"
 const noteHistoryDir = ".history"
+const noteTemplateDir = "templates"
 
 var noteLinkPattern = regexp.MustCompile(`\[\[([^\[\]]+)\]\]`)
 var inlineCodePattern = regexp.MustCompile("`([^`]+)`")
@@ -255,12 +256,10 @@ func createNote(args []string) error {
 
 func templateNote(args []string) error {
 	if len(args) == 0 {
-		printTemplates()
-		return nil
+		return printTemplates()
 	}
 	if len(args) == 1 && args[0] == "list" {
-		printTemplates()
-		return nil
+		return printTemplates()
 	}
 
 	templateName := strings.TrimSpace(args[0])
@@ -1293,9 +1292,9 @@ func buildNoteFromOptions(opts createOptions) (string, noteContent, error) {
 	}
 
 	if opts.Template != "" {
-		template, ok := builtInTemplates()[opts.Template]
-		if !ok {
-			return "", noteContent{}, fmt.Errorf("unknown template %q", opts.Template)
+		template, err := findTemplate(opts.Template)
+		if err != nil {
+			return "", noteContent{}, err
 		}
 		if title == "" {
 			title = template.DefaultTitle()
@@ -1449,6 +1448,23 @@ func loadNotes() ([]noteMeta, error) {
 
 func notePath(id string) string {
 	return filepath.Join(notesDir, id+".md")
+}
+
+func customTemplateDir() string {
+	return filepath.Join(notesDir, noteTemplateDir)
+}
+
+func customTemplatePath(name string) (string, error) {
+	if name == "" {
+		return "", errors.New("template name cannot be empty")
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return "", fmt.Errorf("invalid template name %q", name)
+	}
+	if name == "." || name == ".." {
+		return "", fmt.Errorf("invalid template name %q", name)
+	}
+	return filepath.Join(customTemplateDir(), name+".md"), nil
 }
 
 func formatNote(note noteContent) string {
@@ -3087,22 +3103,99 @@ func builtInTemplates() map[string]noteTemplate {
 	}
 }
 
+func customTemplates() (map[string]noteTemplate, error) {
+	entries, err := os.ReadDir(customTemplateDir())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return map[string]noteTemplate{}, nil
+		}
+		return nil, err
+	}
+
+	templates := make(map[string]noteTemplate)
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+
+		name := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(entry.Name(), ".md")))
+		if name == "" {
+			continue
+		}
+		if _, exists := builtInTemplates()[name]; exists {
+			continue
+		}
+
+		path := filepath.Join(customTemplateDir(), entry.Name())
+		content, err := readNoteContent(path)
+		if err != nil {
+			return nil, err
+		}
+
+		defaultTitle := content.Title
+		body := content.Body
+		defaultTags := append([]string(nil), content.Tags...)
+		templates[name] = noteTemplate{
+			Name:         name,
+			Description:  fmt.Sprintf("Custom template loaded from %s", path),
+			DefaultTitle: func() string { return defaultTitle },
+			DefaultTags:  defaultTags,
+			Body: func(title string) string {
+				return body
+			},
+		}
+	}
+
+	return templates, nil
+}
+
+func allTemplates() (map[string]noteTemplate, error) {
+	templates := builtInTemplates()
+	custom, err := customTemplates()
+	if err != nil {
+		return nil, err
+	}
+	for name, tmpl := range custom {
+		templates[name] = tmpl
+	}
+	return templates, nil
+}
+
+func findTemplate(name string) (noteTemplate, error) {
+	templates, err := allTemplates()
+	if err != nil {
+		return noteTemplate{}, err
+	}
+
+	template, ok := templates[name]
+	if !ok {
+		return noteTemplate{}, fmt.Errorf("unknown template %q", name)
+	}
+	return template, nil
+}
+
 func defaultDailyTitle() string {
 	return now().Format("2006-01-02")
 }
 
-func printTemplates() {
-	names := make([]string, 0, len(builtInTemplates()))
-	for name := range builtInTemplates() {
+func printTemplates() error {
+	templates, err := allTemplates()
+	if err != nil {
+		return err
+	}
+
+	names := make([]string, 0, len(templates))
+	for name := range templates {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
 	fmt.Println("Available templates:")
 	for _, name := range names {
-		template := builtInTemplates()[name]
+		template := templates[name]
 		fmt.Printf("  %s\t%s\n", template.Name, template.Description)
 	}
+	return nil
 }
 
 func validateRenameID(id string) error {
@@ -3123,7 +3216,7 @@ func printUsage() {
 	fmt.Println("")
 	fmt.Println("Commands:")
 	fmt.Println("  create <title> [content] [--tag <tag>] [--tags a,b]  Create a Markdown note")
-	fmt.Println("  create [<title>] [content] --template <name>         Create a note from a built-in template")
+	fmt.Println("  create [<title>] [content] --template <name>         Create a note from a built-in or disk template")
 	fmt.Println("  template [list|<name> [<title>] [content]]           List templates or create from one directly")
 	fmt.Println("  edit <id> [content] [--tag <tag>] [--tags a,b]       Replace note body/tags or open in $EDITOR")
 	fmt.Println("  history <id> [version]       List saved versions or diff one against the current note")

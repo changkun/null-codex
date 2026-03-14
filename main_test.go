@@ -100,6 +100,99 @@ func TestTemplateCommandListsBuiltIns(t *testing.T) {
 	}
 }
 
+func TestCreateNoteFromCustomTemplateLoadsFromDisk(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(customTemplateDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	templateFile, err := customTemplatePath("standup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(templateFile, []byte("# Team Standup\nTags: team, sync\n\n## Updates\n\n## Blockers\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := createNote([]string{"--template", "standup"}); err != nil {
+			t.Fatalf("createNote returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(notePath("team-standup"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "# Team Standup\nTags: sync, team\n\n## Updates\n\n## Blockers\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+	if output != "created team-standup\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestTemplateCommandCreatesCustomTemplateNoteWithExplicitTitle(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(customTemplateDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	templateFile, err := customTemplatePath("retro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(templateFile, []byte("# Sprint Retro\nTags: team\n\n## Went Well\n\n## Needs Work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := templateNote([]string{"retro", "Sprint 42 Retro", "--tag", "eng"}); err != nil {
+			t.Fatalf("templateNote returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(notePath("sprint-42-retro"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "# Sprint 42 Retro\nTags: eng, team\n\n## Went Well\n\n## Needs Work\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+	if output != "created sprint-42-retro\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestTemplateCommandListsCustomTemplates(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(customTemplateDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	templateFile, err := customTemplatePath("retro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(templateFile, []byte("# Sprint Retro\n\n## Went Well\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := templateNote(nil); err != nil {
+			t.Fatalf("templateNote returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "retro") {
+		t.Fatalf("expected custom template in output, got %q", output)
+	}
+}
+
 func TestRunIncludesTemplateCommand(t *testing.T) {
 	withTempDir(t)
 	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
