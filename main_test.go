@@ -275,6 +275,194 @@ func TestRunIncludesEditCommand(t *testing.T) {
 	}
 }
 
+func TestHistoryNoteListsVersionsAndPrintsDiff(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nOld body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := editNote([]string{"daily-log", "New body"}); err != nil {
+		t.Fatalf("editNote returned error: %v", err)
+	}
+
+	historyOutput := captureStdout(t, func() {
+		if err := historyNote([]string{"daily-log"}); err != nil {
+			t.Fatalf("historyNote returned error: %v", err)
+		}
+	})
+
+	lines := strings.Split(strings.TrimSpace(historyOutput), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected 1 history entry, got %d in %q", len(lines), historyOutput)
+	}
+	fields := strings.Split(lines[0], "\t")
+	if len(fields) != 3 {
+		t.Fatalf("expected version fields, got %q", lines[0])
+	}
+	if fields[2] != "edit" {
+		t.Fatalf("expected edit action, got %q", fields[2])
+	}
+
+	diffOutput := captureStdout(t, func() {
+		if err := historyNote([]string{"daily-log", fields[0]}); err != nil {
+			t.Fatalf("historyNote diff returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(diffOutput, "--- history:"+fields[0]) {
+		t.Fatalf("expected diff header, got %q", diffOutput)
+	}
+	if !strings.Contains(diffOutput, "-Old body") || !strings.Contains(diffOutput, "+New body") {
+		t.Fatalf("expected changed body in diff, got %q", diffOutput)
+	}
+}
+
+func TestRestoreNoteRevertsToHistoricalVersion(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nOld body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := editNote([]string{"daily-log", "New body"}); err != nil {
+		t.Fatalf("editNote returned error: %v", err)
+	}
+
+	versionID := firstHistoryVersionID(t, "daily-log")
+	output := captureStdout(t, func() {
+		if err := restoreNote([]string{"daily-log", versionID}); err != nil {
+			t.Fatalf("restoreNote returned error: %v", err)
+		}
+	})
+
+	got, err := os.ReadFile(notePath("daily-log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Daily Log\n\nOld body\n" {
+		t.Fatalf("unexpected restored content: %q", string(got))
+	}
+	if output != "restored daily-log to "+versionID+"\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+
+	historyOutput := captureStdout(t, func() {
+		if err := historyNote([]string{"daily-log"}); err != nil {
+			t.Fatalf("historyNote returned error: %v", err)
+		}
+	})
+	if !strings.Contains(historyOutput, "\trestore\n") {
+		t.Fatalf("expected restore snapshot after rollback, got %q", historyOutput)
+	}
+}
+
+func TestRestoreNoteCanRecoverDeletedNote(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := createNote([]string{"Daily Log", "Body"}); err != nil {
+		t.Fatalf("createNote returned error: %v", err)
+	}
+	if err := deleteNote([]string{"daily-log"}); err != nil {
+		t.Fatalf("deleteNote returned error: %v", err)
+	}
+
+	versionID := firstHistoryVersionID(t, "daily-log")
+	if err := restoreNote([]string{"daily-log", versionID}); err != nil {
+		t.Fatalf("restoreNote returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("daily-log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Daily Log\n\nBody\n" {
+		t.Fatalf("unexpected restored deleted note: %q", string(got))
+	}
+}
+
+func TestEditorEditsCreateHistorySnapshot(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	editorDir := t.TempDir()
+	editorPath := filepath.Join(editorDir, "editor.sh")
+	if err := os.WriteFile(editorPath, []byte("#!/bin/sh\nprintf '# Daily Log\\n\\nEdited in editor\\n' > \"$1\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EDITOR", editorPath)
+
+	if err := editNote([]string{"daily-log"}); err != nil {
+		t.Fatalf("editNote returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("daily-log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Daily Log\n\nEdited in editor\n" {
+		t.Fatalf("unexpected edited content: %q", string(got))
+	}
+
+	historyOutput := captureStdout(t, func() {
+		if err := historyNote([]string{"daily-log"}); err != nil {
+			t.Fatalf("historyNote returned error: %v", err)
+		}
+	})
+	if !strings.Contains(historyOutput, "\tedit\n") {
+		t.Fatalf("expected editor change to be versioned, got %q", historyOutput)
+	}
+}
+
+func TestRunIncludesHistoryAndRestoreCommands(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nOld body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"edit", "daily-log", "New body"}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+
+	historyOutput := captureStdout(t, func() {
+		if err := run([]string{"history", "daily-log"}); err != nil {
+			t.Fatalf("run returned error: %v", err)
+		}
+	})
+	versionID := strings.Split(strings.TrimSpace(historyOutput), "\t")[0]
+
+	if err := run([]string{"restore", "daily-log", versionID}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("daily-log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Daily Log\n\nOld body\n" {
+		t.Fatalf("unexpected restored content: %q", string(got))
+	}
+}
+
 func TestListNotesFiltersByTag(t *testing.T) {
 	withTempDir(t)
 
@@ -1802,4 +1990,17 @@ func setFixedNow(t *testing.T, ts time.Time) {
 	t.Cleanup(func() {
 		now = previous
 	})
+}
+
+func firstHistoryVersionID(t *testing.T, id string) string {
+	t.Helper()
+
+	output := captureStdout(t, func() {
+		if err := historyNote([]string{id}); err != nil {
+			t.Fatalf("historyNote returned error: %v", err)
+		}
+	})
+
+	line := strings.Split(strings.TrimSpace(output), "\n")[0]
+	return strings.Split(line, "\t")[0]
 }

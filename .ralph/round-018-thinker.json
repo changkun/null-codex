@@ -1,0 +1,3 @@
+{
+  "result": "Add built-in note history with `history` and `restore` commands so every edit is versioned locally and users can inspect diffs or roll back a note safely."
+}

@@ -15,6 +15,9 @@ go run . edit daily-log --clear-tags
 go run . archive daily-log
 go run . unarchive daily-log
 go run . rename daily-log project-log
+go run . history daily-log
+go run . history daily-log 20260314T090000.000000000Z-0001-edit
+go run . restore daily-log 20260314T090000.000000000Z-0001-edit
 EDITOR=vim go run . edit daily-log
 EDITOR=vim go run . today
 go run . list --tag work
@@ -39,8 +42,11 @@ go run . doctor --fix --report
 - `create` writes a Markdown file with a heading based on the note title and optional normalized tags, or renders a built-in scaffold with `--template daily|meeting|project`.
 - `template` lists built-in templates with no arguments, or creates a note directly from a template with `template <name> [title]`.
 - `edit` updates an existing note body and tags from the CLI, clears tags with `--clear-tags`, or opens the file in `$EDITOR`.
+- Every create, edit, archive toggle, rename rewrite, delete, browser edit, and editor-driven change stores a local snapshot under `notes/.history/<note-id>/`.
+- `history` lists saved note versions newest-first, or prints a diff between one saved version and the current note state when a version ID is supplied.
 - `archive` and `unarchive` toggle a note's archived status by updating note metadata in place.
 - `rename` changes a note's ID by renaming the Markdown file and updates `[[note-id]]` references across `notes/` without altering note titles, tags, archive status, or non-link body content.
+- `restore` rewrites a note from one saved version so you can safely roll back or recover a deleted note locally.
 - `list` shows note ID, last modified timestamp, title, and tags, filters with repeated `--tag` flags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `search` performs case-insensitive full-text search across note titles and bodies, can be narrowed to notes matching all requested tags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `today` creates `notes/YYYY-MM-DD.md` from the built-in daily template when missing and opens today's daily note in `$EDITOR`.
@@ -69,3 +75,5 @@ Built-in templates add reusable body scaffolds and default tags:
 - `daily`: top-of-mind, priorities, notes, wins, tomorrow
 - `meeting`: details, notes, decisions, action items
 - `project`: summary, goals, milestones, links, next actions
+
+Version IDs are filesystem-local snapshots with a UTC timestamp, sequence number, and action suffix, for example `20260314T090000.000000000Z-0001-edit`.

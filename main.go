@@ -19,6 +19,7 @@ import (
 )
 
 const notesDir = "notes"
+const noteHistoryDir = ".history"
 
 var noteLinkPattern = regexp.MustCompile(`\[\[([^\[\]]+)\]\]`)
 var inlineCodePattern = regexp.MustCompile("`([^`]+)`")
@@ -55,6 +56,13 @@ type brokenLink struct {
 type noteEdge struct {
 	Source string
 	Target string
+}
+
+type noteVersion struct {
+	ID        string
+	Timestamp time.Time
+	Action    string
+	Path      string
 }
 
 type serveOptions struct {
@@ -170,6 +178,8 @@ func run(args []string) error {
 		return templateNote(args[1:])
 	case "edit":
 		return editNote(args[1:])
+	case "history":
+		return historyNote(args[1:])
 	case "list", "ls":
 		return listNotes(args[1:])
 	case "search":
@@ -194,6 +204,8 @@ func run(args []string) error {
 		return serveNotes(args[1:])
 	case "delete", "rm":
 		return deleteNote(args[1:])
+	case "restore":
+		return restoreNote(args[1:])
 	case "doctor":
 		return doctorNotes(args[1:])
 	case "help", "-h", "--help":
@@ -399,12 +411,16 @@ func openTodayNote() error {
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(path, []byte(formatNote(content)), 0o644); err != nil {
+		formatted := formatNote(content)
+		if err := os.WriteFile(path, []byte(formatted), 0o644); err != nil {
+			return err
+		}
+		if err := appendHistoryVersion(today, "create", []byte(formatted)); err != nil {
 			return err
 		}
 	}
 
-	return openInEditor(path)
+	return openNoteInEditor(today)
 }
 
 func editNote(args []string) error {
@@ -423,7 +439,7 @@ func editNote(args []string) error {
 	}
 
 	if len(args) == 1 {
-		return openInEditor(path)
+		return openNoteInEditor(id)
 	}
 
 	content, err := readNoteContent(path)
@@ -440,7 +456,7 @@ func editNote(args []string) error {
 	}
 
 	if opts.Body == "" && len(opts.Tags) == 0 && !opts.ClearTags {
-		return openInEditor(path)
+		return openNoteInEditor(id)
 	}
 
 	if opts.Body != "" {
@@ -453,7 +469,7 @@ func editNote(args []string) error {
 		content.Tags = opts.Tags
 	}
 
-	if err := os.WriteFile(path, []byte(formatNote(content)), 0o644); err != nil {
+	if err := writeNoteVersioned(id, "edit", []byte(formatNote(content))); err != nil {
 		return err
 	}
 
@@ -876,15 +892,23 @@ func deleteNote(args []string) error {
 		return errors.New("delete requires a note id")
 	}
 
-	path := notePath(args[0])
-	if err := os.Remove(path); err != nil {
+	id := args[0]
+	path := notePath(id)
+	data, err := os.ReadFile(path)
+	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("note %q not found", args[0])
+			return fmt.Errorf("note %q not found", id)
 		}
 		return err
 	}
+	if err := appendHistoryVersion(id, "delete", data); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
 
-	fmt.Printf("deleted %s\n", args[0])
+	fmt.Printf("deleted %s\n", id)
 	return nil
 }
 
@@ -981,14 +1005,34 @@ func renameNote(args []string) error {
 		return err
 	}
 
+	rollbackRename := func(cause error) error {
+		if rollbackErr := os.Rename(newPath, oldPath); rollbackErr != nil {
+			return fmt.Errorf("%v (rollback failed: %v)", cause, rollbackErr)
+		}
+		if moveErr := moveHistory(newID, oldID); moveErr != nil {
+			return fmt.Errorf("%v (history rollback failed: %v)", cause, moveErr)
+		}
+		return cause
+	}
+
 	if err := os.Rename(oldPath, newPath); err != nil {
 		return err
 	}
-	if err := renameLinkedReferences(oldID, newID); err != nil {
+	if err := moveHistory(oldID, newID); err != nil {
 		if rollbackErr := os.Rename(newPath, oldPath); rollbackErr != nil {
-			return fmt.Errorf("update links after rename: %v (rollback failed: %v)", err, rollbackErr)
+			return fmt.Errorf("move history after rename: %v (rollback failed: %v)", err, rollbackErr)
 		}
 		return err
+	}
+	oldData, err := os.ReadFile(newPath)
+	if err != nil {
+		return rollbackRename(fmt.Errorf("read renamed note: %w", err))
+	}
+	if err := appendHistoryVersion(newID, "rename", oldData); err != nil {
+		return rollbackRename(fmt.Errorf("record history after rename: %w", err))
+	}
+	if err := renameLinkedReferences(oldID, newID); err != nil {
+		return rollbackRename(fmt.Errorf("update links after rename: %w", err))
 	}
 
 	fmt.Printf("renamed %s to %s\n", oldID, newID)
@@ -1022,7 +1066,7 @@ func setArchived(args []string, archived bool) error {
 	}
 
 	content.Archived = archived
-	if err := os.WriteFile(path, []byte(formatNote(content)), 0o644); err != nil {
+	if err := writeNoteVersioned(id, map[bool]string{true: "archive", false: "unarchive"}[archived], []byte(formatNote(content))); err != nil {
 		return err
 	}
 
@@ -1053,6 +1097,30 @@ func openInEditor(path string) error {
 	return cmd.Run()
 }
 
+func openNoteInEditor(id string) error {
+	path := notePath(id)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("note %q not found", id)
+		}
+		return err
+	}
+
+	if err := openInEditor(path); err != nil {
+		return err
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if string(after) == string(before) {
+		return nil
+	}
+	return appendHistoryVersion(id, "edit", before)
+}
+
 func createNoteFromOptions(opts createOptions) error {
 	if err := validateCreateOptions(opts.noteOptions); err != nil {
 		return err
@@ -1067,7 +1135,11 @@ func createNoteFromOptions(opts createOptions) error {
 		return err
 	}
 
-	if err := os.WriteFile(notePath(id), []byte(formatNote(content)), 0o644); err != nil {
+	formatted := formatNote(content)
+	if err := os.WriteFile(notePath(id), []byte(formatted), 0o644); err != nil {
+		return err
+	}
+	if err := appendHistoryVersion(id, "create", []byte(formatted)); err != nil {
 		return err
 	}
 
@@ -1307,6 +1379,9 @@ func renameLinkedReferences(oldID, newID string) error {
 
 		info, err := entry.Info()
 		if err != nil {
+			return err
+		}
+		if err := appendHistoryVersion(strings.TrimSuffix(entry.Name(), ".md"), "rename-links", data); err != nil {
 			return err
 		}
 		if err := os.WriteFile(path, []byte(updated), info.Mode()); err != nil {
@@ -2061,7 +2136,11 @@ func createWebNote(form webNoteForm) (string, error) {
 	if err := os.MkdirAll(notesDir, 0o755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(notePath(id), []byte(formatNote(content)), 0o644); err != nil {
+	formatted := formatNote(content)
+	if err := os.WriteFile(notePath(id), []byte(formatted), 0o644); err != nil {
+		return "", err
+	}
+	if err := appendHistoryVersion(id, "create", []byte(formatted)); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -2087,7 +2166,295 @@ func updateWebNote(id string, form webNoteForm) error {
 	content.Body = form.Body
 	content.Archived = form.Archived
 
-	return os.WriteFile(path, []byte(formatNote(content)), 0o644)
+	return writeNoteVersioned(id, "edit", []byte(formatNote(content)))
+}
+
+func historyNote(args []string) error {
+	if len(args) < 1 || len(args) > 2 {
+		return errors.New("history requires a note id and optional version id")
+	}
+
+	id := strings.TrimSpace(args[0])
+	versions, err := loadNoteVersions(id)
+	if err != nil {
+		return err
+	}
+	if len(versions) == 0 {
+		return fmt.Errorf("no history found for %q", id)
+	}
+
+	if len(args) == 1 {
+		for i := len(versions) - 1; i >= 0; i-- {
+			version := versions[i]
+			fmt.Printf("%s\t%s\t%s\n", version.ID, version.Timestamp.Format(time.RFC3339Nano), version.Action)
+		}
+		return nil
+	}
+
+	version, err := findNoteVersion(id, args[1])
+	if err != nil {
+		return err
+	}
+	current, currentErr := os.ReadFile(notePath(id))
+	if currentErr != nil && !errors.Is(currentErr, fs.ErrNotExist) {
+		return currentErr
+	}
+	target, err := os.ReadFile(version.Path)
+	if err != nil {
+		return err
+	}
+
+	currentLabel := notePath(id)
+	if errors.Is(currentErr, fs.ErrNotExist) {
+		currentLabel = "(deleted)"
+		current = nil
+	}
+	fmt.Print(unifiedDiff("history:"+version.ID, currentLabel, string(target), string(current)))
+	return nil
+}
+
+func restoreNote(args []string) error {
+	if len(args) != 2 {
+		return errors.New("restore requires a note id and version id")
+	}
+
+	id := strings.TrimSpace(args[0])
+	version, err := findNoteVersion(id, args[1])
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(version.Path)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		return err
+	}
+	if err := writeNoteVersioned(id, "restore", data); err != nil {
+		return err
+	}
+
+	fmt.Printf("restored %s to %s\n", id, version.ID)
+	return nil
+}
+
+func writeNoteVersioned(id, action string, newData []byte) error {
+	path := notePath(id)
+	oldData, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err == nil && string(oldData) == string(newData) {
+		return os.WriteFile(path, newData, 0o644)
+	}
+	if err == nil {
+		if err := appendHistoryVersion(id, action, oldData); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(path, newData, 0o644)
+}
+
+func appendHistoryVersion(id, action string, data []byte) error {
+	if err := os.MkdirAll(historyPath(id), 0o755); err != nil {
+		return err
+	}
+
+	versionID, err := nextVersionID(id, action)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(historyVersionPath(id, versionID), data, 0o644)
+}
+
+func nextVersionID(id, action string) (string, error) {
+	entries, err := os.ReadDir(historyPath(id))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		return "", err
+	}
+
+	seq := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		seq++
+	}
+	return fmt.Sprintf("%s-%04d-%s", now().UTC().Format("20060102T150405.000000000Z"), seq+1, slugify(action)), nil
+}
+
+func loadNoteVersions(id string) ([]noteVersion, error) {
+	entries, err := os.ReadDir(historyPath(id))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var versions []noteVersion
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+		versionID := strings.TrimSuffix(entry.Name(), ".md")
+		version, err := parseNoteVersion(id, versionID)
+		if err != nil {
+			return nil, err
+		}
+		versions = append(versions, version)
+	}
+	sort.Slice(versions, func(i, j int) bool {
+		if versions[i].Timestamp.Equal(versions[j].Timestamp) {
+			return versions[i].ID < versions[j].ID
+		}
+		return versions[i].Timestamp.Before(versions[j].Timestamp)
+	})
+	return versions, nil
+}
+
+func findNoteVersion(id, versionID string) (noteVersion, error) {
+	versionID = strings.TrimSpace(versionID)
+	version, err := parseNoteVersion(id, versionID)
+	if err != nil {
+		return noteVersion{}, err
+	}
+	if _, err := os.Stat(version.Path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return noteVersion{}, fmt.Errorf("version %q not found for %q", versionID, id)
+		}
+		return noteVersion{}, err
+	}
+	return version, nil
+}
+
+func parseNoteVersion(id, versionID string) (noteVersion, error) {
+	parts := strings.SplitN(versionID, "-", 3)
+	if len(parts) != 3 {
+		return noteVersion{}, fmt.Errorf("invalid version %q", versionID)
+	}
+	timestamp, err := time.Parse("20060102T150405.000000000Z", parts[0])
+	if err != nil {
+		return noteVersion{}, fmt.Errorf("invalid version %q", versionID)
+	}
+	return noteVersion{
+		ID:        versionID,
+		Timestamp: timestamp,
+		Action:    parts[2],
+		Path:      historyVersionPath(id, versionID),
+	}, nil
+}
+
+func moveHistory(oldID, newID string) error {
+	oldHistory := historyPath(oldID)
+	if _, err := os.Stat(oldHistory); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	newHistory := historyPath(newID)
+	if _, err := os.Stat(newHistory); err == nil {
+		return fmt.Errorf("history for %q already exists", newID)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(newHistory), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(oldHistory, newHistory)
+}
+
+func historyPath(id string) string {
+	return filepath.Join(notesDir, noteHistoryDir, id)
+}
+
+func historyVersionPath(id, versionID string) string {
+	return filepath.Join(historyPath(id), versionID+".md")
+}
+
+func unifiedDiff(fromLabel, toLabel, fromText, toText string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "--- %s\n", fromLabel)
+	fmt.Fprintf(&b, "+++ %s\n", toLabel)
+
+	fromLines := splitDiffLines(fromText)
+	toLines := splitDiffLines(toText)
+	ops := diffOperations(fromLines, toLines)
+	for _, op := range ops {
+		switch op.kind {
+		case "equal":
+			fmt.Fprintf(&b, " %s\n", op.line)
+		case "delete":
+			fmt.Fprintf(&b, "-%s\n", op.line)
+		case "insert":
+			fmt.Fprintf(&b, "+%s\n", op.line)
+		}
+	}
+	return b.String()
+}
+
+type diffOp struct {
+	kind string
+	line string
+}
+
+func splitDiffLines(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	if text == "" {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func diffOperations(a, b []string) []diffOp {
+	lcs := make([][]int, len(a)+1)
+	for i := range lcs {
+		lcs[i] = make([]int, len(b)+1)
+	}
+	for i := len(a) - 1; i >= 0; i-- {
+		for j := len(b) - 1; j >= 0; j-- {
+			if a[i] == b[j] {
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			} else if lcs[i+1][j] >= lcs[i][j+1] {
+				lcs[i][j] = lcs[i+1][j]
+			} else {
+				lcs[i][j] = lcs[i][j+1]
+			}
+		}
+	}
+
+	var ops []diffOp
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] == b[j]:
+			ops = append(ops, diffOp{kind: "equal", line: a[i]})
+			i++
+			j++
+		case lcs[i+1][j] >= lcs[i][j+1]:
+			ops = append(ops, diffOp{kind: "delete", line: a[i]})
+			i++
+		default:
+			ops = append(ops, diffOp{kind: "insert", line: b[j]})
+			j++
+		}
+	}
+	for ; i < len(a); i++ {
+		ops = append(ops, diffOp{kind: "delete", line: a[i]})
+	}
+	for ; j < len(b); j++ {
+		ops = append(ops, diffOp{kind: "insert", line: b[j]})
+	}
+	return ops
 }
 
 func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML {
@@ -2488,6 +2855,7 @@ func printUsage() {
 	fmt.Println("  create [<title>] [content] --template <name>         Create a note from a built-in template")
 	fmt.Println("  template [list|<name> [<title>] [content]]           List templates or create from one directly")
 	fmt.Println("  edit <id> [content] [--tag <tag>] [--tags a,b]       Replace note body/tags or open in $EDITOR")
+	fmt.Println("  history <id> [version]       List saved versions or diff one against the current note")
 	fmt.Println("  archive <id>                Mark a note as archived")
 	fmt.Println("  unarchive <id>              Remove archived status from a note")
 	fmt.Println("  rename <old-id> <new-id>    Rename a note file and rewrite matching note links")
@@ -2500,5 +2868,6 @@ func printUsage() {
 	fmt.Println("  graph                     Emit the notebook link graph as Graphviz DOT")
 	fmt.Println("  serve [--addr host:port]  Serve a local web UI for browsing rendered notes")
 	fmt.Println("  delete <id>               Delete a note")
+	fmt.Println("  restore <id> <version>    Restore a note from local history")
 	fmt.Println("  doctor [--fix] [--report] Check for broken wiki links and orphaned notes")
 }
