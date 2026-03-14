@@ -39,6 +39,7 @@ var markdownLinkPattern = regexp.MustCompile(`\[(.*?)\]\(([^)]+)\)`)
 var inlineCodePattern = regexp.MustCompile("`([^`]+)`")
 var boldPattern = regexp.MustCompile(`\*\*([^*]+)\*\*`)
 var italicPattern = regexp.MustCompile(`\*([^*]+)\*`)
+var taskDuePattern = regexp.MustCompile(`(?i)\s*\[?due:\s*(\d{4}-\d{2}-\d{2})\]?\s*$`)
 
 var now = time.Now
 
@@ -71,10 +72,14 @@ type searchResult struct {
 }
 
 type noteTask struct {
-	Text   string
-	Line   int
-	Open   bool
-	Source string
+	Text      string
+	RawText   string
+	Line      int
+	Open      bool
+	Source    string
+	DueDate   string
+	DueTime   time.Time
+	DueStatus string
 }
 
 type brokenLink struct {
@@ -140,6 +145,10 @@ type notebookPageData struct {
 	ShowTasks       bool
 	TasksPageURL    string
 	JournalPageURL  string
+	TaskView        string
+	AllTasksURL     string
+	UpcomingTasksURL string
+	OverdueTasksURL string
 	Notes           []webNoteSummary
 	TaskGroups      []webTaskGroup
 	CurrentNote     *webNoteDetail
@@ -164,8 +173,10 @@ type webNoteSummary struct {
 }
 
 type webTask struct {
-	Text string
-	Line int
+	Text      string
+	Line      int
+	DueDate   string
+	DueStatus string
 }
 
 type webTaskGroup struct {
@@ -176,6 +187,7 @@ type webTaskGroup struct {
 	ModTime   string
 	DetailURL string
 	Tasks     []webTask
+	NextDue   string
 }
 
 type webNoteDetail struct {
@@ -258,6 +270,7 @@ type webFilterOptions struct {
 	Tags         []string
 	TagsInput    string
 	ArchivedMode string
+	TaskView     string
 }
 
 type webJournalView struct {
@@ -477,6 +490,14 @@ func searchNotes(args []string) error {
 }
 
 func listTasks(args []string) error {
+	view := "all"
+	if len(args) > 0 {
+		switch args[0] {
+		case "upcoming", "overdue":
+			view = args[0]
+			args = args[1:]
+		}
+	}
 	if len(args) > 0 && args[0] == "toggle" {
 		return toggleTask(args[1:])
 	}
@@ -495,6 +516,7 @@ func listTasks(args []string) error {
 	notes = filterArchivedNotes(notes, opts)
 
 	var groups []webTaskGroup
+	today := dateOnly(now())
 	for _, note := range notes {
 		content, err := readNoteContent(notePath(note.ID))
 		if err != nil {
@@ -514,23 +536,42 @@ func listTasks(args []string) error {
 			ModTime:  note.ModTime.Format(time.RFC3339),
 		}
 		for _, task := range tasks {
+			task = annotateTaskDue(task, today)
+			if !taskMatchesView(task, view) {
+				continue
+			}
 			group.Tasks = append(group.Tasks, webTask{
-				Text: task.Text,
-				Line: task.Line,
+				Text:      task.Text,
+				Line:      task.Line,
+				DueDate:   task.DueDate,
+				DueStatus: task.DueStatus,
 			})
 		}
+		if len(group.Tasks) == 0 {
+			continue
+		}
+		group.NextDue = nextDueDate(group.Tasks)
 		groups = append(groups, group)
 	}
 
+	sortTaskGroups(groups, view)
+
 	if len(groups) == 0 {
-		fmt.Println("no open tasks found")
+		switch view {
+		case "upcoming":
+			fmt.Println("no upcoming tasks found")
+		case "overdue":
+			fmt.Println("no overdue tasks found")
+		default:
+			fmt.Println("no open tasks found")
+		}
 		return nil
 	}
 
 	for _, group := range groups {
 		fmt.Printf("%s\t%s\t%s\t%s\n", group.ID, group.ModTime, group.Title, formatTags(group.Tags))
 		for _, task := range group.Tasks {
-			fmt.Printf("\t%d\t[ ] %s\n", task.Line, task.Text)
+			fmt.Printf("\t%d\t[ ] %s%s\n", task.Line, task.Text, formatTaskDueSuffix(task))
 		}
 	}
 
@@ -1094,6 +1135,10 @@ func (s *notebookServer) serveIndexPage(w http.ResponseWriter, r *http.Request) 
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
 		JournalPageURL:  journalURL(defaultJournalDate()),
+		TaskView:        filter.TaskView,
+		AllTasksURL:     tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "all"}),
+		UpcomingTasksURL: tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "upcoming"}),
+		OverdueTasksURL: tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "overdue"}),
 		LiveReload:      s.watch,
 	}
 
@@ -1137,6 +1182,10 @@ func (s *notebookServer) serveJournalPage(w http.ResponseWriter, r *http.Request
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
 		JournalPageURL:  journalURL(selectedDate),
+		TaskView:        filter.TaskView,
+		AllTasksURL:     tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "all"}),
+		UpcomingTasksURL: tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "upcoming"}),
+		OverdueTasksURL: tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "overdue"}),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		Journal:         &journal,
 		LiveReload:      s.watch,
@@ -1211,9 +1260,9 @@ func (s *notebookServer) serveTasksPage(w http.ResponseWriter, r *http.Request) 
 	}
 
 	data := notebookPageData{
-		Title:           "Open Tasks",
-		HeaderTitle:     "Open Tasks",
-		HeaderSubtitle:  fmt.Sprintf("%d open %s", taskCount, pluralize(taskCount, "task", "tasks")),
+		Title:           taskPageTitle(filter.TaskView),
+		HeaderTitle:     taskPageTitle(filter.TaskView),
+		HeaderSubtitle:  fmt.Sprintf("%d %s", taskCount, taskSubtitleLabel(filter.TaskView, taskCount)),
 		SearchQuery:     filter.Query,
 		FilterTagsInput: filter.TagsInput,
 		ActiveTags:      append([]string(nil), filter.Tags...),
@@ -1224,6 +1273,10 @@ func (s *notebookServer) serveTasksPage(w http.ResponseWriter, r *http.Request) 
 		ShowTasks:       true,
 		TasksPageURL:    tasksURL(filter),
 		JournalPageURL:  journalURL(defaultJournalDate()),
+		TaskView:        filter.TaskView,
+		AllTasksURL:     tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "all"}),
+		UpcomingTasksURL: tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "upcoming"}),
+		OverdueTasksURL: tasksURL(webFilterOptions{Tags: append([]string(nil), filter.Tags...), ArchivedMode: filter.ArchivedMode, TaskView: "overdue"}),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		TaskGroups:      taskGroups,
 		LiveReload:      s.watch,
@@ -2799,12 +2852,17 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 				ModTime:   note.ModTime.Format(time.RFC3339),
 				DetailURL: noteURL(note.ID),
 			}
+			today := dateOnly(now())
 			for _, task := range tasks {
+				task = annotateTaskDue(task, today)
 				group.Tasks = append(group.Tasks, webTask{
-					Text: task.Text,
-					Line: task.Line,
+					Text:      task.Text,
+					Line:      task.Line,
+					DueDate:   task.DueDate,
+					DueStatus: task.DueStatus,
 				})
 			}
+			group.NextDue = nextDueDate(group.Tasks)
 			snapshot.TaskGroups = append(snapshot.TaskGroups, group)
 		}
 	}
@@ -2815,12 +2873,7 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 		}
 		return snapshot.Notes[i].ModTime > snapshot.Notes[j].ModTime
 	})
-	sort.Slice(snapshot.TaskGroups, func(i, j int) bool {
-		if snapshot.TaskGroups[i].ModTime == snapshot.TaskGroups[j].ModTime {
-			return snapshot.TaskGroups[i].ID < snapshot.TaskGroups[j].ID
-		}
-		return snapshot.TaskGroups[i].ModTime > snapshot.TaskGroups[j].ModTime
-	})
+	sortTaskGroups(snapshot.TaskGroups, "all")
 	return snapshot, nil
 }
 
@@ -2877,6 +2930,7 @@ func parseWebFilterOptions(values url.Values) webFilterOptions {
 	filter := webFilterOptions{
 		Query:        strings.TrimSpace(values.Get("q")),
 		ArchivedMode: queryArchivedMode(values),
+		TaskView:     queryTaskView(values),
 	}
 	filter.Tags = parseWebTags(values.Get("tags"))
 	for _, tag := range values["tag"] {
@@ -2926,8 +2980,24 @@ func filterTaskGroups(groups []webTaskGroup, filter webFilterOptions) []webTaskG
 		if filter.ArchivedMode == "only" && !group.Archived {
 			continue
 		}
-		filtered = append(filtered, group)
+		current := group
+		current.Tasks = nil
+		for _, task := range group.Tasks {
+			if filter.TaskView == "upcoming" && !(task.DueStatus == "today" || task.DueStatus == "upcoming") {
+				continue
+			}
+			if filter.TaskView == "overdue" && task.DueStatus != "overdue" {
+				continue
+			}
+			current.Tasks = append(current.Tasks, task)
+		}
+		if len(current.Tasks) == 0 {
+			continue
+		}
+		current.NextDue = nextDueDate(current.Tasks)
+		filtered = append(filtered, current)
 	}
+	sortTaskGroups(filtered, filter.TaskView)
 	return filtered
 }
 
@@ -2940,6 +3010,15 @@ func queryArchivedMode(values url.Values) string {
 		return "only"
 	default:
 		return "exclude"
+	}
+}
+
+func queryTaskView(values url.Values) string {
+	switch strings.ToLower(strings.TrimSpace(values.Get("view"))) {
+	case "upcoming", "overdue":
+		return strings.ToLower(strings.TrimSpace(values.Get("view")))
+	default:
+		return "all"
 	}
 }
 
@@ -2988,6 +3067,9 @@ func tasksURL(filter webFilterOptions) string {
 	case "only":
 		values.Set("archived", "only")
 	}
+	if filter.TaskView != "" && filter.TaskView != "all" {
+		values.Set("view", filter.TaskView)
+	}
 	if encoded := values.Encode(); encoded != "" {
 		return "/tasks?" + encoded
 	}
@@ -3018,6 +3100,9 @@ func filterQueryString(filter webFilterOptions, includeQuery bool) string {
 	case "only":
 		values.Set("archived", "only")
 	}
+	if filter.TaskView != "" && filter.TaskView != "all" {
+		values.Set("view", filter.TaskView)
+	}
 	if encoded := values.Encode(); encoded != "" {
 		return "?" + encoded
 	}
@@ -3031,6 +3116,7 @@ func buildTagFilters(page string, availableTags []string, filter webFilterOption
 			Query:        filter.Query,
 			Tags:         append([]string(nil), filter.Tags...),
 			ArchivedMode: filter.ArchivedMode,
+			TaskView:     filter.TaskView,
 		}
 		active := hasAllTags(filter.Tags, []string{tag})
 		if active {
@@ -3057,6 +3143,7 @@ func clearTagFiltersURL(page string, filter webFilterOptions) string {
 	next := webFilterOptions{
 		Query:        filter.Query,
 		ArchivedMode: filter.ArchivedMode,
+		TaskView:     filter.TaskView,
 	}
 	return filterPageURL(page, next)
 }
@@ -3071,6 +3158,28 @@ func safeReturnURL(raw, fallback string) string {
 
 func notebookSubtitle(count int) string {
 	return fmt.Sprintf("%d %s", count, pluralize(count, "note", "notes"))
+}
+
+func taskPageTitle(view string) string {
+	switch view {
+	case "upcoming":
+		return "Upcoming Tasks"
+	case "overdue":
+		return "Overdue Tasks"
+	default:
+		return "Open Tasks"
+	}
+}
+
+func taskSubtitleLabel(view string, count int) string {
+	switch view {
+	case "upcoming":
+		return pluralize(count, "upcoming task", "upcoming tasks")
+	case "overdue":
+		return pluralize(count, "overdue task", "overdue tasks")
+	default:
+		return "open " + pluralize(count, "task", "tasks")
+	}
 }
 
 func defaultJournalDate() time.Time {
@@ -4094,7 +4203,8 @@ func renderListItemMarkdown(noteID, text string, existing map[string]struct{}, t
 	if !task.Open {
 		checked = " checked"
 	}
-	body := renderInlineMarkdown(noteID, task.Text, existing)
+	task = annotateTaskDue(task, dateOnly(now()))
+	body := renderInlineMarkdown(noteID, task.Text, existing) + renderTaskDueBadge(task)
 	if tasks == nil || tasks.NoteID == "" {
 		return `<label class="task-item"><input type="checkbox" disabled` + checked + `><span>` + body + `</span></label>`
 	}
@@ -4105,6 +4215,23 @@ func renderListItemMarkdown(noteID, text string, existing map[string]struct{}, t
 		`<input type="hidden" name="return_to" value="` + html.EscapeString(tasks.ReturnURL) + `">` +
 		`<label class="task-item task-item-toggle"><input type="checkbox" onchange="this.form.submit()"` + checked + `><span>` + body + `</span></label>` +
 		`</form>`
+}
+
+func renderTaskDueBadge(task noteTask) string {
+	if task.DueDate == "" {
+		return ""
+	}
+	label := "Due " + task.DueDate
+	className := "task-due"
+	switch task.DueStatus {
+	case "overdue":
+		label += " overdue"
+		className += " overdue"
+	case "today":
+		label += " today"
+		className += " today"
+	}
+	return ` <span class="` + className + `">` + html.EscapeString(label) + `</span>`
 }
 
 func renderInlineMarkdown(noteID, text string, existing map[string]struct{}) string {
@@ -4224,7 +4351,7 @@ func toggleTaskLine(data string, line int) (string, noteTask, error) {
 		state = "[ ]"
 	}
 
-	lines[line-1] = indent + trimmed[:2] + state + " " + task.Text
+	lines[line-1] = indent + trimmed[:2] + state + " " + task.RawText
 	task.Line = line
 	return strings.Join(lines, "\n"), task, nil
 }
@@ -4238,14 +4365,103 @@ func parseTaskLine(text string) (noteTask, bool) {
 	}
 
 	state := text[1]
+	rawText := strings.TrimSpace(text[4:])
+	body, dueDate, dueTime := splitTaskDue(rawText)
 	switch state {
 	case ' ':
-		return noteTask{Text: strings.TrimSpace(text[4:]), Open: true}, true
+		return noteTask{Text: body, RawText: rawText, Open: true, DueDate: dueDate, DueTime: dueTime}, true
 	case 'x', 'X':
-		return noteTask{Text: strings.TrimSpace(text[4:]), Open: false}, true
+		return noteTask{Text: body, RawText: rawText, Open: false, DueDate: dueDate, DueTime: dueTime}, true
 	default:
 		return noteTask{}, false
 	}
+}
+
+func splitTaskDue(text string) (string, string, time.Time) {
+	matches := taskDuePattern.FindStringSubmatch(text)
+	if len(matches) != 2 {
+		return strings.TrimSpace(text), "", time.Time{}
+	}
+	dueTime, err := time.ParseInLocation("2006-01-02", matches[1], time.UTC)
+	if err != nil {
+		return strings.TrimSpace(text), "", time.Time{}
+	}
+	body := strings.TrimSpace(taskDuePattern.ReplaceAllString(text, ""))
+	return body, matches[1], dueTime
+}
+
+func annotateTaskDue(task noteTask, today time.Time) noteTask {
+	if task.DueDate == "" || task.DueTime.IsZero() {
+		return task
+	}
+	switch {
+	case task.DueTime.Before(today):
+		task.DueStatus = "overdue"
+	case task.DueTime.Equal(today):
+		task.DueStatus = "today"
+	default:
+		task.DueStatus = "upcoming"
+	}
+	return task
+}
+
+func taskMatchesView(task noteTask, view string) bool {
+	switch view {
+	case "upcoming":
+		return task.DueStatus == "today" || task.DueStatus == "upcoming"
+	case "overdue":
+		return task.DueStatus == "overdue"
+	default:
+		return true
+	}
+}
+
+func formatTaskDueSuffix(task webTask) string {
+	if task.DueDate == "" {
+		return ""
+	}
+	switch task.DueStatus {
+	case "overdue":
+		return " (due " + task.DueDate + ", overdue)"
+	case "today":
+		return " (due " + task.DueDate + ", today)"
+	default:
+		return " (due " + task.DueDate + ")"
+	}
+}
+
+func nextDueDate(tasks []webTask) string {
+	next := ""
+	for _, task := range tasks {
+		if task.DueDate == "" {
+			continue
+		}
+		if next == "" || task.DueDate < next {
+			next = task.DueDate
+		}
+	}
+	return next
+}
+
+func sortTaskGroups(groups []webTaskGroup, view string) {
+	sort.Slice(groups, func(i, j int) bool {
+		if view != "all" {
+			if groups[i].NextDue != groups[j].NextDue {
+				switch {
+				case groups[i].NextDue == "":
+					return false
+				case groups[j].NextDue == "":
+					return true
+				default:
+					return groups[i].NextDue < groups[j].NextDue
+				}
+			}
+		}
+		if groups[i].ModTime == groups[j].ModTime {
+			return groups[i].ID < groups[j].ID
+		}
+		return groups[i].ModTime > groups[j].ModTime
+	})
 }
 
 func renderWikiLinks(text string, existing map[string]struct{}) string {
@@ -4332,6 +4548,10 @@ func notebookPageTemplate() *template.Template {
     .task-item { display:flex; align-items:flex-start; gap:0.6rem; }
     .task-item input { margin-top:0.2rem; }
     .task-item-toggle { cursor:pointer; }
+    .task-due { display:inline-flex; margin-left:0.55rem; padding:0.12rem 0.45rem; border-radius:999px; border:1px solid var(--line); background:#f8f3ec; color:var(--muted); font-size:0.8rem; white-space:nowrap; }
+    .task-due.today { border-color:var(--accent); background:var(--accent-soft); color:var(--accent); }
+    .task-due.overdue { border-color:#efb3ab; background:var(--warn-soft); color:var(--warn); }
+    .task-views { display:flex; gap:0.55rem; flex-wrap:wrap; margin-top:1rem; }
     .attachments { display:grid; gap:0.75rem; margin-top:1rem; }
     .attachment-item { display:flex; justify-content:space-between; gap:1rem; align-items:center; padding:0.8rem 0.9rem; border:1px solid var(--line); border-radius:14px; background:#fff; }
     .attachment-preview { max-width:100%; border-radius:12px; border:1px solid var(--line); margin-top:0.75rem; }
@@ -4375,6 +4595,9 @@ func notebookPageTemplate() *template.Template {
         <h1>{{.HeaderTitle}}</h1>
         <div class="subtitle">{{.HeaderSubtitle}}</div>
         <form class="filter-form" method="get" action="{{.FilterPage}}">
+          {{if and .ShowTasks (ne .TaskView "all")}}
+            <input name="view" type="hidden" value="{{.TaskView}}">
+          {{end}}
           <div class="field">
             <label for="sidebar-search">Search</label>
             <input id="sidebar-search" name="q" type="search" value="{{.SearchQuery}}" placeholder="Title or body">
@@ -4642,6 +4865,11 @@ func notebookPageTemplate() *template.Template {
           <div class="eyebrow">Notebook</div>
           <h1>{{.HeaderTitle}}</h1>
           <p>{{.HeaderSubtitle}}</p>
+          <div class="task-views">
+            <a class="filter-link {{if eq .TaskView "all"}}active{{end}}" href="{{.AllTasksURL}}">All</a>
+            <a class="filter-link {{if eq .TaskView "upcoming"}}active{{end}}" href="{{.UpcomingTasksURL}}">Upcoming</a>
+            <a class="filter-link {{if eq .TaskView "overdue"}}active{{end}}" href="{{.OverdueTasksURL}}">Overdue</a>
+          </div>
           {{if .TaskGroups}}
             <div class="task-groups">
               {{range .TaskGroups}}
@@ -4660,7 +4888,7 @@ func notebookPageTemplate() *template.Template {
                         <input type="hidden" name="note" value="{{$group.ID}}">
                         <input type="hidden" name="line" value="{{.Line}}">
                         <input type="hidden" name="return_to" value="{{$.TasksPageURL}}">
-                        <label class="task-item task-item-toggle"><input type="checkbox" onchange="this.form.submit()"><span>{{.Text}}</span></label>
+                        <label class="task-item task-item-toggle"><input type="checkbox" onchange="this.form.submit()"><span>{{.Text}}{{if .DueDate}} <span class="task-due {{if eq .DueStatus "today"}}today{{else if eq .DueStatus "overdue"}}overdue{{end}}">Due {{.DueDate}}{{if eq .DueStatus "today"}} today{{else if eq .DueStatus "overdue"}} overdue{{end}}</span>{{end}}</span></label>
                       </form>
                     {{end}}
                   </div>
@@ -4668,7 +4896,7 @@ func notebookPageTemplate() *template.Template {
               {{end}}
             </div>
           {{else}}
-            <div class="empty">No open tasks match this filter.</div>
+            <div class="empty">{{if eq .TaskView "upcoming"}}No upcoming tasks match this filter.{{else if eq .TaskView "overdue"}}No overdue tasks match this filter.{{else}}No open tasks match this filter.{{end}}</div>
           {{end}}
         {{else}}
           <div class="eyebrow">Notebook</div>
@@ -4885,7 +5113,7 @@ func printUsage() {
 	fmt.Println("  rename <old-id> <new-id>    Rename a note file and rewrite matching note links")
 	fmt.Println("  list [--tag <tag>]... [--include-archived|--archived-only]   List saved notes")
 	fmt.Println("  search <query> [--tag <tag>]... [--include-archived|--archived-only] Search note titles and bodies")
-	fmt.Println("  tasks [--tag <tag>]... [--include-archived|--archived-only]  List open Markdown checkbox tasks with line numbers")
+	fmt.Println("  tasks [upcoming|overdue] [--tag <tag>]... [--include-archived|--archived-only]  List open Markdown checkbox tasks with line numbers")
 	fmt.Println("  tasks toggle <id> <line>   Toggle a Markdown checkbox task by file line")
 	fmt.Println("  today                     Create or open today's daily note")
 	fmt.Println("  inbox [--task] <text>     Append a quick capture to the inbox note")

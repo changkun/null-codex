@@ -29,6 +29,8 @@ go run . list --tag work
 go run . list --include-archived
 go run . list --archived-only
 go run . tasks --tag work
+go run . tasks upcoming --tag work
+go run . tasks overdue
 go run . tasks --include-archived
 go run . tasks toggle daily-log 12
 go run . search shipped --tag work
@@ -59,7 +61,7 @@ go run . sync
 - `rename` changes a note's ID by renaming the Markdown file and updates `[[note-id]]` references across `notes/` without altering note titles, tags, archive status, or non-link body content.
 - `restore` rewrites a note from one saved version so you can safely roll back or recover a deleted note locally.
 - `list` shows note ID, last modified timestamp, title, and tags, filters with repeated `--tag` flags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
-- `tasks` indexes Markdown checkbox items like `- [ ] follow up` across all notes, groups every open task by note, prints each task's file line number, filters with repeated `--tag` flags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
+- `tasks` indexes Markdown checkbox items like `- [ ] follow up due: 2026-03-20` across all notes, groups every open task by note, prints each task's file line number, parses trailing `due: YYYY-MM-DD` markers, filters with repeated `--tag` flags, and hides archived notes unless `--include-archived` or `--archived-only` is provided. `tasks upcoming` shows only tasks due today or later, and `tasks overdue` shows only past-due work.
 - `tasks toggle <id> <line>` flips the checkbox state for the Markdown task at that file line and records the change in note history.
 - `search` performs case-insensitive full-text search across note titles and bodies, can be narrowed to notes matching all requested tags, and hides archived notes unless `--include-archived` or `--archived-only` is provided.
 - `today` creates `notes/YYYY-MM-DD.md` from the built-in daily template when missing and opens today's daily note in `$EDITOR`.
@@ -68,7 +70,7 @@ go run . sync
 - `links` lists the note IDs referenced by `[[note-id]]` links in a note body.
 - `backlinks` lists the note IDs that link to the requested note.
 - `graph` emits the notebook's `[[note-id]]` link structure as Graphviz DOT, including dashed nodes for missing link targets.
-- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, surfaces a notebook-wide open task view at `/tasks`, supports toggling Markdown checkboxes from note pages and the task view, supports creating and editing notes directly in the browser, and lets you upload note attachments with optional image embedding from note pages. Pass `--watch` to poll `notes/`, rebuild the link/task index automatically, and reload open browser views when files change on disk.
+- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, surfaces notebook-wide task views at `/tasks` for all, upcoming, and overdue work, supports toggling Markdown checkboxes from note pages and task views, supports creating and editing notes directly in the browser, and lets you upload note attachments with optional image embedding from note pages. Pass `--watch` to poll `notes/`, rebuild the link/task index automatically, and reload open browser views when files change on disk.
 - `delete` removes the note file from `notes/`.
 - `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets. `doctor --fix` creates stub notes for missing link targets, and `--report` lists each created stub note.
 - `sync` treats `notes/` as its own Git repository, stages notebook changes, creates a `sync notebook <timestamp>` commit when needed, then runs `git pull --rebase` and `git push` against the branch upstream configured for `notes/`.
@@ -109,6 +111,13 @@ Attachment: architecture.png | Architecture Diagram.png | image/png
 Attachment: spec.pdf | Spec.pdf | application/pdf
 
 ![Architecture Diagram.png](.attachments/daily-log/architecture.png)
+```
+
+Tasks can include due dates directly in Markdown by ending the checkbox text with `due: YYYY-MM-DD`:
+
+```md
+- [ ] Ship release due: 2026-03-20
+- [ ] File expenses [due: 2026-03-31]
 ```
 
 Built-in templates add reusable body scaffolds and default tags:

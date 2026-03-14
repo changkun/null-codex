@@ -1127,6 +1127,50 @@ func TestListTasksPrintsNoOpenTasksMessage(t *testing.T) {
 	}
 }
 
+func TestListTasksUpcomingAndOverdueFiltersDueDates(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	body := "# Project\nTags: work\n\n- [ ] Overdue task due: 2026-03-13\n- [ ] Today task due: 2026-03-14\n- [ ] Future task due: 2026-03-20\n- [ ] Unscheduled task\n"
+	if err := os.WriteFile(notePath("project"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	upcoming := captureStdout(t, func() {
+		if err := listTasks([]string{"upcoming"}); err != nil {
+			t.Fatalf("listTasks returned error: %v", err)
+		}
+	})
+	if strings.Contains(upcoming, "Overdue task") {
+		t.Fatalf("expected overdue task to be filtered out, got %q", upcoming)
+	}
+	if !strings.Contains(upcoming, "Today task (due 2026-03-14, today)") {
+		t.Fatalf("expected due-today task in upcoming output, got %q", upcoming)
+	}
+	if !strings.Contains(upcoming, "Future task (due 2026-03-20)") {
+		t.Fatalf("expected future task in upcoming output, got %q", upcoming)
+	}
+	if strings.Contains(upcoming, "Unscheduled task") {
+		t.Fatalf("expected unscheduled task to be excluded from upcoming output, got %q", upcoming)
+	}
+
+	overdue := captureStdout(t, func() {
+		if err := listTasks([]string{"overdue"}); err != nil {
+			t.Fatalf("listTasks returned error: %v", err)
+		}
+	})
+	if !strings.Contains(overdue, "Overdue task (due 2026-03-13, overdue)") {
+		t.Fatalf("expected overdue task in output, got %q", overdue)
+	}
+	if strings.Contains(overdue, "Today task") || strings.Contains(overdue, "Future task") {
+		t.Fatalf("expected non-overdue tasks to be filtered out, got %q", overdue)
+	}
+}
+
 func TestRunIncludesTasksCommand(t *testing.T) {
 	withTempDir(t)
 
@@ -1177,6 +1221,31 @@ func TestToggleTaskUpdatesCheckboxByFileLine(t *testing.T) {
 	want := "# Project\nTags: work\n\n- [x] Ship release\n- [x] Write recap\n"
 	if string(got) != want {
 		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+}
+
+func TestToggleTaskPreservesDueDateMarkup(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("project"), []byte("# Project\n\n- [ ] Ship release due: 2026-03-20\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := listTasks([]string{"toggle", "project", "3"}); err != nil {
+		t.Fatalf("listTasks returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("project"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# Project\n\n- [x] Ship release due: 2026-03-20\n"
+	if string(got) != want {
+		t.Fatalf("expected due date markup to be preserved, got %q", string(got))
 	}
 }
 
@@ -1951,6 +2020,19 @@ func TestRenderMarkdownHTMLRendersCheckboxItems(t *testing.T) {
 	}
 }
 
+func TestRenderMarkdownHTMLShowsDueDateBadges(t *testing.T) {
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	got := string(renderMarkdownHTML("", noteContent{Body: "- [ ] Today due: 2026-03-14\n- [ ] Late due: 2026-03-13", BodyLine: 1}, nil, nil))
+
+	if !strings.Contains(got, `Due 2026-03-14 today`) {
+		t.Fatalf("expected due-today badge, got %q", got)
+	}
+	if !strings.Contains(got, `class="task-due overdue"`) {
+		t.Fatalf("expected overdue badge class, got %q", got)
+	}
+}
+
 func TestRenderMarkdownHTMLRendersToggleFormsWhenTaskContextPresent(t *testing.T) {
 	got := string(renderMarkdownHTML(
 		"project",
@@ -2570,6 +2652,56 @@ func TestServeTasksPageRendersGroupedOpenTasks(t *testing.T) {
 	}
 	if !strings.Contains(body, `href="/tasks?tag=work"`) {
 		t.Fatalf("expected task-page filter links to stay on /tasks, got %q", body)
+	}
+}
+
+func TestServeTasksPageSupportsUpcomingAndOverdueViews(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\n\n- [ ] Overdue due: 2026-03-10\n- [ ] Today due: 2026-03-14\n- [ ] Future due: 2026-03-16\n- [ ] Unscheduled\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	upcomingReq := httptest.NewRequest(http.MethodGet, "/tasks?view=upcoming", nil)
+	upcomingRec := httptest.NewRecorder()
+	newTestServeMux(t).ServeHTTP(upcomingRec, upcomingReq)
+	if upcomingRec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", upcomingRec.Code)
+	}
+	upcomingBody := upcomingRec.Body.String()
+	if !strings.Contains(upcomingBody, "Upcoming Tasks") {
+		t.Fatalf("expected upcoming heading, got %q", upcomingBody)
+	}
+	if strings.Contains(upcomingBody, "Overdue due") || strings.Contains(upcomingBody, "Unscheduled") {
+		t.Fatalf("expected upcoming view to filter tasks, got %q", upcomingBody)
+	}
+	if !strings.Contains(upcomingBody, "Due 2026-03-14 today") {
+		t.Fatalf("expected due-today badge in upcoming view, got %q", upcomingBody)
+	}
+	if !strings.Contains(upcomingBody, `href="/tasks?view=overdue"`) {
+		t.Fatalf("expected overdue tab link, got %q", upcomingBody)
+	}
+
+	overdueReq := httptest.NewRequest(http.MethodGet, "/tasks?view=overdue", nil)
+	overdueRec := httptest.NewRecorder()
+	newTestServeMux(t).ServeHTTP(overdueRec, overdueReq)
+	if overdueRec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", overdueRec.Code)
+	}
+	overdueBody := overdueRec.Body.String()
+	if !strings.Contains(overdueBody, "Overdue Tasks") {
+		t.Fatalf("expected overdue heading, got %q", overdueBody)
+	}
+	if !strings.Contains(overdueBody, "Due 2026-03-10 overdue") {
+		t.Fatalf("expected overdue badge, got %q", overdueBody)
+	}
+	if strings.Contains(overdueBody, "Today due") || strings.Contains(overdueBody, "Future due") {
+		t.Fatalf("expected overdue view to filter non-overdue tasks, got %q", overdueBody)
 	}
 }
 
