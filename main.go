@@ -119,6 +119,7 @@ type notebookPageData struct {
 	Notes           []webNoteSummary
 	TaskGroups      []webTaskGroup
 	CurrentNote     *webNoteDetail
+	NoteHistory     *webNoteHistory
 	NoteForm        *webNoteForm
 }
 
@@ -160,6 +161,30 @@ type webNoteDetail struct {
 	Backlinks         []webLink
 	BrokenLinks       []string
 	OutgoingLinksText string
+}
+
+type webNoteVersion struct {
+	ID         string
+	Timestamp  string
+	Action     string
+	BrowseURL  string
+	IsSelected bool
+}
+
+type webNoteHistory struct {
+	NoteID          string
+	NoteTitle       string
+	NoteURL         string
+	Versions        []webNoteVersion
+	SelectedVersion *webNoteVersionDetail
+}
+
+type webNoteVersionDetail struct {
+	ID         string
+	Timestamp  string
+	Action     string
+	Diff       string
+	RestoreURL string
 }
 
 type taskRenderOptions struct {
@@ -925,6 +950,14 @@ func serveCreateNote(w http.ResponseWriter, r *http.Request) {
 func serveNotePage(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/notes/")
 	path = strings.TrimSpace(strings.Trim(path, "/"))
+	isHistoryRestoreRoute := strings.HasSuffix(path, "/history/restore")
+	if isHistoryRestoreRoute {
+		path = strings.TrimSpace(strings.TrimSuffix(path, "/history/restore"))
+	}
+	isHistoryRoute := !isHistoryRestoreRoute && strings.HasSuffix(path, "/history")
+	if isHistoryRoute {
+		path = strings.TrimSpace(strings.TrimSuffix(path, "/history"))
+	}
 	isEditRoute := strings.HasSuffix(path, "/edit")
 	if isEditRoute {
 		path = strings.TrimSpace(strings.TrimSuffix(path, "/edit"))
@@ -947,6 +980,22 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		serveEditNotePage(w, r, id)
+		return
+	}
+	if isHistoryRestoreRoute {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		serveRestoreNote(w, r, id)
+		return
+	}
+	if isHistoryRoute {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		serveNoteHistoryPage(w, r, id)
 		return
 	}
 
@@ -996,6 +1045,48 @@ func renderNotebookPageStatus(w http.ResponseWriter, status int, data notebookPa
 	if err := notebookPageTemplate().Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func serveNoteHistoryPage(w http.ResponseWriter, r *http.Request, id string) {
+	snapshot, err := buildNotebookSnapshot()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	detail, ok := snapshot.RenderedNotes[id]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	history, err := buildWebNoteHistory(id, strings.TrimSpace(r.URL.Query().Get("version")))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, fs.ErrNotExist) || strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "invalid version") {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	history.NoteTitle = detail.Title
+
+	data := notebookPageData{
+		Title:           "History for " + detail.Title,
+		HeaderTitle:     "Note History",
+		HeaderSubtitle:  id,
+		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
+		AvailableTags:   snapshot.Tags,
+		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		FilterPage:      "/",
+		TasksPageURL:    tasksURL(strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		CurrentNote:     &detail,
+		NoteHistory:     history,
+	}
+	renderNotebookPage(w, data)
 }
 
 func serveEditNotePage(w http.ResponseWriter, r *http.Request, id string) {
@@ -1060,6 +1151,31 @@ func serveUpdateNote(w http.ResponseWriter, r *http.Request, id string) {
 
 	if err := updateWebNote(id, form); err != nil {
 		renderWebFormError(w, r, http.StatusBadRequest, "Edit Note", id, form, err)
+		return
+	}
+
+	http.Redirect(w, r, noteURL(id), http.StatusSeeOther)
+}
+
+func serveRestoreNote(w http.ResponseWriter, r *http.Request, id string) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	versionID := strings.TrimSpace(r.FormValue("version"))
+	if versionID == "" {
+		http.Error(w, "missing version id", http.StatusBadRequest)
+		return
+	}
+	if err := restoreNoteVersion(id, versionID); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, fs.ErrNotExist) || strings.Contains(err.Error(), "not found") {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "invalid version") {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 
@@ -1927,6 +2043,20 @@ func noteURL(id string) string {
 	return "/notes/" + url.PathEscape(id)
 }
 
+func noteHistoryURL(id string) string {
+	return noteURL(id) + "/history"
+}
+
+func noteHistoryVersionURL(id, versionID string) string {
+	values := url.Values{}
+	values.Set("version", versionID)
+	return noteHistoryURL(id) + "?" + values.Encode()
+}
+
+func noteRestoreURL(id string) string {
+	return noteHistoryURL(id) + "/restore"
+}
+
 func noteEditURL(id string) string {
 	return noteURL(id) + "/edit"
 }
@@ -2475,21 +2605,11 @@ func historyNote(args []string) error {
 	if err != nil {
 		return err
 	}
-	current, currentErr := os.ReadFile(notePath(id))
-	if currentErr != nil && !errors.Is(currentErr, fs.ErrNotExist) {
-		return currentErr
-	}
-	target, err := os.ReadFile(version.Path)
+	diff, err := noteVersionDiff(id, version)
 	if err != nil {
 		return err
 	}
-
-	currentLabel := notePath(id)
-	if errors.Is(currentErr, fs.ErrNotExist) {
-		currentLabel = "(deleted)"
-		current = nil
-	}
-	fmt.Print(unifiedDiff("history:"+version.ID, currentLabel, string(target), string(current)))
+	fmt.Print(diff)
 	return nil
 }
 
@@ -2499,7 +2619,16 @@ func restoreNote(args []string) error {
 	}
 
 	id := strings.TrimSpace(args[0])
-	version, err := findNoteVersion(id, args[1])
+	versionID := strings.TrimSpace(args[1])
+	if err := restoreNoteVersion(id, versionID); err != nil {
+		return err
+	}
+	fmt.Printf("restored %s to %s\n", id, versionID)
+	return nil
+}
+
+func restoreNoteVersion(id, versionID string) error {
+	version, err := findNoteVersion(id, versionID)
 	if err != nil {
 		return err
 	}
@@ -2511,12 +2640,7 @@ func restoreNote(args []string) error {
 	if err := os.MkdirAll(notesDir, 0o755); err != nil {
 		return err
 	}
-	if err := writeNoteVersioned(id, "restore", data); err != nil {
-		return err
-	}
-
-	fmt.Printf("restored %s to %s\n", id, version.ID)
-	return nil
+	return writeNoteVersioned(id, "restore", data)
 }
 
 func writeNoteVersioned(id, action string, newData []byte) error {
@@ -2610,6 +2734,72 @@ func findNoteVersion(id, versionID string) (noteVersion, error) {
 		return noteVersion{}, err
 	}
 	return version, nil
+}
+
+func buildWebNoteHistory(id, selectedVersionID string) (*webNoteHistory, error) {
+	versions, err := loadNoteVersions(id)
+	if err != nil {
+		return nil, err
+	}
+
+	history := &webNoteHistory{
+		NoteID:   id,
+		NoteURL:  noteURL(id),
+		Versions: make([]webNoteVersion, 0, len(versions)),
+	}
+	if len(versions) == 0 {
+		return history, nil
+	}
+
+	selectedVersion := versions[len(versions)-1]
+	if selectedVersionID != "" {
+		selectedVersion, err = findNoteVersion(id, selectedVersionID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for i := len(versions) - 1; i >= 0; i-- {
+		version := versions[i]
+		history.Versions = append(history.Versions, webNoteVersion{
+			ID:         version.ID,
+			Timestamp:  version.Timestamp.Format(time.RFC3339Nano),
+			Action:     version.Action,
+			BrowseURL:  noteHistoryVersionURL(id, version.ID),
+			IsSelected: version.ID == selectedVersion.ID,
+		})
+	}
+
+	diff, err := noteVersionDiff(id, selectedVersion)
+	if err != nil {
+		return nil, err
+	}
+	history.SelectedVersion = &webNoteVersionDetail{
+		ID:         selectedVersion.ID,
+		Timestamp:  selectedVersion.Timestamp.Format(time.RFC3339Nano),
+		Action:     selectedVersion.Action,
+		Diff:       diff,
+		RestoreURL: noteRestoreURL(id),
+	}
+
+	return history, nil
+}
+
+func noteVersionDiff(id string, version noteVersion) (string, error) {
+	current, currentErr := os.ReadFile(notePath(id))
+	if currentErr != nil && !errors.Is(currentErr, fs.ErrNotExist) {
+		return "", currentErr
+	}
+	target, err := os.ReadFile(version.Path)
+	if err != nil {
+		return "", err
+	}
+
+	currentLabel := notePath(id)
+	if errors.Is(currentErr, fs.ErrNotExist) {
+		currentLabel = "(deleted)"
+		current = nil
+	}
+	return unifiedDiff("history:"+version.ID, currentLabel, string(target), string(current)), nil
 }
 
 func parseNoteVersion(id, versionID string) (noteVersion, error) {
@@ -2957,9 +3147,10 @@ func renderWikiLinks(text string, existing map[string]struct{}) string {
 
 func notebookPageTemplate() *template.Template {
 	return template.Must(template.New("notebook").Funcs(template.FuncMap{
-		"tagURL":      tagURL,
-		"clearTagURL": clearTagURL,
-		"noteEditURL": noteEditURL,
+		"tagURL":         tagURL,
+		"clearTagURL":    clearTagURL,
+		"noteEditURL":    noteEditURL,
+		"noteHistoryURL": noteHistoryURL,
 	}).Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -3020,10 +3211,19 @@ func notebookPageTemplate() *template.Template {
     .task-item input { margin-top:0.2rem; }
     .task-item-toggle { cursor:pointer; }
     .form-actions { display:flex; gap:0.75rem; flex-wrap:wrap; }
+    .history-layout { display:grid; grid-template-columns: minmax(240px, 320px) minmax(0, 1fr); gap:1rem; align-items:start; }
+    .history-list { display:grid; gap:0.75rem; }
+    .history-item { display:block; border:1px solid var(--line); border-radius:14px; padding:0.85rem 0.95rem; background:#fff; text-decoration:none; }
+    .history-item.active { border-color:var(--accent); background:var(--accent-soft); }
+    .history-item strong { display:block; margin-bottom:0.25rem; }
+    .history-panel { border:1px solid var(--line); border-radius:16px; padding:1rem; background:#fff; }
+    .history-actions { display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:1rem; }
+    .history-restore-form { margin:0; }
     @media (max-width: 880px) {
       .layout { grid-template-columns: 1fr; }
       .sidebar { border-right:none; border-bottom:1px solid var(--line); }
       .content { padding-top:1rem; }
+      .history-layout { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -3104,6 +3304,7 @@ func notebookPageTemplate() *template.Template {
           <div class="meta">{{.CurrentNote.ModTime}}{{if .CurrentNote.Archived}} · <span class="archived">archived</span>{{end}}</div>
           <div class="actions">
             <a class="button secondary" href="{{noteEditURL .CurrentNote.ID}}">Edit note</a>
+            <a class="button secondary" href="{{noteHistoryURL .CurrentNote.ID}}">History</a>
           </div>
           {{if .CurrentNote.Tags}}
             <div class="meta" style="margin-top:0.75rem;">
@@ -3139,6 +3340,40 @@ func notebookPageTemplate() *template.Template {
               <div class="empty">No backlinks yet.</div>
             {{end}}
           </div>
+          {{if .NoteHistory}}
+            <div class="section">
+              <h2>History</h2>
+              {{if .NoteHistory.Versions}}
+                <div class="history-layout">
+                  <div class="history-list">
+                    {{range .NoteHistory.Versions}}
+                      <a class="history-item {{if .IsSelected}}active{{end}}" href="{{.BrowseURL}}">
+                        <strong>{{.Action}}</strong>
+                        <div class="meta">{{.Timestamp}}</div>
+                        <div class="meta"><code>{{.ID}}</code></div>
+                      </a>
+                    {{end}}
+                  </div>
+                  {{with .NoteHistory.SelectedVersion}}
+                    <div class="history-panel">
+                      <div class="history-actions">
+                        <a class="button secondary" href="{{$.NoteHistory.NoteURL}}">Back to note</a>
+                        <form class="history-restore-form" method="post" action="{{.RestoreURL}}">
+                          <input type="hidden" name="version" value="{{.ID}}">
+                          <button class="button" type="submit">Restore this version</button>
+                        </form>
+                      </div>
+                      <h3>{{.Action}}</h3>
+                      <div class="meta">{{.Timestamp}}</div>
+                      <pre><code>{{.Diff}}</code></pre>
+                    </div>
+                  {{end}}
+                </div>
+              {{else}}
+                <div class="empty">No saved history for this note yet.</div>
+              {{end}}
+            </div>
+          {{end}}
         {{else if .ShowTasks}}
           <div class="eyebrow">Notebook</div>
           <h1>{{.HeaderTitle}}</h1>

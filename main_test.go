@@ -2328,6 +2328,83 @@ func TestServeUpdateNotePostEditsNote(t *testing.T) {
 	}
 }
 
+func TestServeNoteHistoryPageRendersVersionsAndDiff(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\n\nOld body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := editNote([]string{"alpha", "New body."}); err != nil {
+		t.Fatalf("editNote returned error: %v", err)
+	}
+
+	versionID := firstHistoryVersionID(t, "alpha")
+	req := httptest.NewRequest(http.MethodGet, "/notes/alpha/history?version="+url.QueryEscape(versionID), nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Restore this version") {
+		t.Fatalf("expected restore action, got %q", body)
+	}
+	if !strings.Contains(body, `action="/notes/alpha/history/restore"`) {
+		t.Fatalf("expected restore form action, got %q", body)
+	}
+	if !strings.Contains(body, `name="version" value="`+versionID+`"`) {
+		t.Fatalf("expected selected version in form, got %q", body)
+	}
+	if !strings.Contains(body, "-Old body.") || !strings.Contains(body, "+New body.") {
+		t.Fatalf("expected version diff in body, got %q", body)
+	}
+}
+
+func TestServeRestoreNotePostRestoresSelectedVersion(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\n\nOld body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := editNote([]string{"alpha", "New body."}); err != nil {
+		t.Fatalf("editNote returned error: %v", err)
+	}
+
+	versionID := firstHistoryVersionID(t, "alpha")
+	form := url.Values{"version": {versionID}}
+	req := httptest.NewRequest(http.MethodPost, "/notes/alpha/history/restore", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get("Location"); location != "/notes/alpha" {
+		t.Fatalf("unexpected redirect target: %q", location)
+	}
+
+	got, err := os.ReadFile(notePath("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Alpha\n\nOld body.\n" {
+		t.Fatalf("unexpected restored content: %q", string(got))
+	}
+}
+
 func withTempDir(t *testing.T) {
 	t.Helper()
 
