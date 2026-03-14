@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"html"
@@ -270,6 +271,8 @@ func run(args []string) error {
 		return restoreNote(args[1:])
 	case "doctor":
 		return doctorNotes(args[1:])
+	case "sync":
+		return syncNotes(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -1297,6 +1300,61 @@ func doctorNotes(args []string) error {
 	return nil
 }
 
+func syncNotes(args []string) error {
+	if len(args) != 0 {
+		return errors.New("sync does not take any arguments")
+	}
+
+	if _, err := os.Stat(notesDir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%s is not a Git repository; initialize it with git and configure a remote first", notesDir)
+		}
+		return err
+	}
+
+	if _, err := runGit("rev-parse", "--is-inside-work-tree"); err != nil {
+		return fmt.Errorf("%s is not a Git repository; initialize it with git and configure a remote first", notesDir)
+	}
+
+	upstream, err := runGit("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	if err != nil {
+		return errors.New("notes Git remote is not configured; set an upstream branch for notes/ before syncing")
+	}
+	upstream = strings.TrimSpace(upstream)
+	if upstream == "" {
+		return errors.New("notes Git remote is not configured; set an upstream branch for notes/ before syncing")
+	}
+
+	if _, err := runGit("add", "--all", "."); err != nil {
+		return err
+	}
+
+	committed := false
+	if hasChanges, err := gitHasStagedChanges(); err != nil {
+		return err
+	} else if hasChanges {
+		message := fmt.Sprintf("sync notebook %s", now().UTC().Format(time.RFC3339))
+		if _, err := runGit("commit", "-m", message); err != nil {
+			return err
+		}
+		committed = true
+	}
+
+	if _, err := runGit("pull", "--rebase"); err != nil {
+		return err
+	}
+	if _, err := runGit("push"); err != nil {
+		return err
+	}
+
+	if committed {
+		fmt.Printf("synced notes with %s\n", upstream)
+	} else {
+		fmt.Printf("synced notes with %s (no local changes)\n", upstream)
+	}
+	return nil
+}
+
 func renameNote(args []string) error {
 	if len(args) != 2 {
 		return errors.New("rename requires an old id and new id")
@@ -1413,6 +1471,39 @@ func openInEditor(path string) error {
 	cmd.Stderr = os.Stderr
 
 	return cmd.Run()
+}
+
+func runGit(args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", notesDir}, args...)...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = strings.TrimSpace(stdout.String())
+		}
+		if message == "" {
+			message = err.Error()
+		}
+		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), message)
+	}
+
+	return stdout.String(), nil
+}
+
+func gitHasStagedChanges() (bool, error) {
+	cmd := exec.Command("git", "-C", notesDir, "diff", "--cached", "--quiet", "--exit-code")
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return true, nil
+		}
+		return false, fmt.Errorf("git diff --cached --quiet --exit-code: %v", err)
+	}
+	return false, nil
 }
 
 func openNoteInEditor(id string) error {
@@ -3623,4 +3714,5 @@ func printUsage() {
 	fmt.Println("  delete <id>               Delete a note")
 	fmt.Println("  restore <id> <version>    Restore a note from local history")
 	fmt.Println("  doctor [--fix] [--report] Check for broken wiki links and orphaned notes")
+	fmt.Println("  sync                      Commit note changes and pull/push notes/ to its Git upstream")
 }

@@ -38,6 +38,7 @@ go run . serve --addr 127.0.0.1:9090
 go run . delete daily-log
 go run . doctor
 go run . doctor --fix --report
+go run . sync
 ```
 
 ## Behavior
@@ -62,6 +63,23 @@ go run . doctor --fix --report
 - `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, surfaces a notebook-wide open task view at `/tasks`, supports toggling Markdown checkboxes from note pages and the task view, and supports creating and editing notes directly in the browser.
 - `delete` removes the note file from `notes/`.
 - `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets. `doctor --fix` creates stub notes for missing link targets, and `--report` lists each created stub note.
+- `sync` treats `notes/` as its own Git repository, stages notebook changes, creates a `sync notebook <timestamp>` commit when needed, then runs `git pull --rebase` and `git push` against the branch upstream configured for `notes/`.
+
+## Git Sync Setup
+
+Initialize the notebook repository once and point it at a remote:
+
+```bash
+mkdir -p notes
+git -C notes init -b main
+git -C notes config user.name "Your Name"
+git -C notes config user.email "you@example.com"
+git -C notes remote add origin <remote-url>
+git -C notes commit --allow-empty -m "init"
+git -C notes push -u origin main
+```
+
+After that, `go run . sync` will back up local note changes and bring down remote notebook updates for multi-machine use.
 
 ## Note Format
 

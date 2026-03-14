@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -553,6 +554,93 @@ func TestRunIncludesHistoryAndRestoreCommands(t *testing.T) {
 	}
 	if string(got) != "# Daily Log\n\nOld body\n" {
 		t.Fatalf("unexpected restored content: %q", string(got))
+	}
+}
+
+func TestSyncCommitsAndPushesNotebookChanges(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	remotePath := setupGitSyncRepo(t)
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nSynced body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := syncNotes(nil); err != nil {
+			t.Fatalf("syncNotes returned error: %v", err)
+		}
+	})
+
+	if output != "synced notes with origin/main\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+
+	logOutput := strings.TrimSpace(runGitCommand(t, notesDir, "log", "--format=%s", "-1"))
+	if logOutput != "sync notebook 2026-03-14T09:00:00Z" {
+		t.Fatalf("unexpected commit message: %q", logOutput)
+	}
+
+	cloneDir := t.TempDir()
+	runGitCommand(t, "", "clone", remotePath, cloneDir)
+	got, err := os.ReadFile(filepath.Join(cloneDir, "daily-log.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Daily Log\n\nSynced body\n" {
+		t.Fatalf("unexpected remote note content: %q", string(got))
+	}
+}
+
+func TestSyncPullsRemoteChangesBeforePushing(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	remotePath := setupGitSyncRepo(t)
+	if err := os.WriteFile(notePath("local-note"), []byte("# Local Note\n\nLocal body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	otherClone := t.TempDir()
+	runGitCommand(t, "", "clone", remotePath, otherClone)
+	configureGitIdentity(t, otherClone)
+	if err := os.WriteFile(filepath.Join(otherClone, "remote-note.md"), []byte("# Remote Note\n\nRemote body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitCommand(t, otherClone, "add", "--all", ".")
+	runGitCommand(t, otherClone, "commit", "-m", "remote change")
+	runGitCommand(t, otherClone, "push", "origin", "main")
+
+	if err := syncNotes(nil); err != nil {
+		t.Fatalf("syncNotes returned error: %v", err)
+	}
+
+	if _, err := os.Stat(notePath("remote-note")); err != nil {
+		t.Fatalf("expected pulled remote note, got %v", err)
+	}
+
+	cloneDir := t.TempDir()
+	runGitCommand(t, "", "clone", remotePath, cloneDir)
+	if _, err := os.Stat(filepath.Join(cloneDir, "local-note.md")); err != nil {
+		t.Fatalf("expected pushed local note, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cloneDir, "remote-note.md")); err != nil {
+		t.Fatalf("expected remote note to remain after sync, got %v", err)
+	}
+}
+
+func TestSyncRequiresConfiguredUpstream(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitCommand(t, notesDir, "init", "-b", "main")
+	configureGitIdentity(t, notesDir)
+
+	err := syncNotes(nil)
+	if err == nil || err.Error() != "notes Git remote is not configured; set an upstream branch for notes/ before syncing" {
+		t.Fatalf("expected upstream configuration error, got %v", err)
 	}
 }
 
@@ -2423,6 +2511,43 @@ func withTempDir(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func setupGitSyncRepo(t *testing.T) string {
+	t.Helper()
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	remotePath := filepath.Join(t.TempDir(), "remote.git")
+	runGitCommand(t, "", "init", "--bare", remotePath)
+	runGitCommand(t, notesDir, "init", "-b", "main")
+	configureGitIdentity(t, notesDir)
+	runGitCommand(t, notesDir, "remote", "add", "origin", remotePath)
+	runGitCommand(t, notesDir, "commit", "--allow-empty", "-m", "init")
+	runGitCommand(t, notesDir, "push", "-u", "origin", "main")
+	return remotePath
+}
+
+func configureGitIdentity(t *testing.T, dir string) {
+	t.Helper()
+	runGitCommand(t, dir, "config", "user.name", "Notes Test")
+	runGitCommand(t, dir, "config", "user.email", "notes@example.com")
+}
+
+func runGitCommand(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(output))
+	}
+	return string(output)
 }
 
 func captureStdout(t *testing.T, fn func()) string {

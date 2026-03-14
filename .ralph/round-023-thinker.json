@@ -1,0 +1,3 @@
+{
+  "result": "Goal: implement notebook synchronization via Git, with a `sync` command that commits local note changes and pulls/pushes them to a configured remote for backup and multi-machine use."
+}
