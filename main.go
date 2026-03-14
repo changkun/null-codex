@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -36,6 +37,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "create", "new":
 		return createNote(args[1:])
+	case "edit":
+		return editNote(args[1:])
 	case "list", "ls":
 		return listNotes()
 	case "view", "show":
@@ -74,10 +77,7 @@ func createNote(args []string) error {
 		return err
 	}
 
-	content := fmt.Sprintf("# %s\n\n", title)
-	if body != "" {
-		content += body + "\n"
-	}
+	content := formatNote(title, body)
 
 	path := notePath(id)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -138,6 +138,40 @@ func listNotes() error {
 	return nil
 }
 
+func editNote(args []string) error {
+	if len(args) == 0 {
+		return errors.New("edit requires a note id")
+	}
+
+	id := args[0]
+	path := notePath(id)
+
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("note %q not found", id)
+		}
+		return err
+	}
+
+	if len(args) == 1 {
+		return openInEditor(path)
+	}
+
+	title, err := readTitle(path)
+	if err != nil {
+		return err
+	}
+
+	body := strings.Join(args[1:], " ")
+	content := formatNote(title, body)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return err
+	}
+
+	fmt.Printf("edited %s\n", id)
+	return nil
+}
+
 func viewNote(args []string) error {
 	if len(args) != 1 {
 		return errors.New("view requires a note id")
@@ -170,6 +204,25 @@ func deleteNote(args []string) error {
 
 	fmt.Printf("deleted %s\n", args[0])
 	return nil
+}
+
+func openInEditor(path string) error {
+	editor := strings.TrimSpace(os.Getenv("EDITOR"))
+	if editor == "" {
+		return errors.New("EDITOR is not set")
+	}
+
+	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		return errors.New("EDITOR is not set")
+	}
+
+	cmd := exec.Command(parts[0], append(parts[1:], path)...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
 }
 
 func nextNoteID(title string) (string, error) {
@@ -215,6 +268,14 @@ func notePath(id string) string {
 	return filepath.Join(notesDir, id+".md")
 }
 
+func formatNote(title, body string) string {
+	content := fmt.Sprintf("# %s\n\n", title)
+	if body != "" {
+		content += body + "\n"
+	}
+	return content
+}
+
 func slugify(input string) string {
 	var b strings.Builder
 	lastDash := false
@@ -240,6 +301,7 @@ func printUsage() {
 	fmt.Println("")
 	fmt.Println("Commands:")
 	fmt.Println("  create <title> [content]  Create a Markdown note")
+	fmt.Println("  edit <id> [content]       Replace note body or open in $EDITOR")
 	fmt.Println("  list                      List saved notes")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  delete <id>               Delete a note")

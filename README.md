@@ -6,6 +6,8 @@ A minimal terminal-based note-taking app in Go. Notes are stored as local Markdo
 
 ```bash
 go run . create "Daily Log" "Shipped the first version."
+go run . edit daily-log "Replaced the body from the CLI."
+EDITOR=vim go run . edit daily-log
 go run . list
 go run . view daily-log
 go run . delete daily-log
@@ -14,6 +16,7 @@ go run . delete daily-log
 ## Behavior
 
 - `create` writes a Markdown file with a heading based on the note title.
+- `edit` updates an existing note either by replacing the body from the CLI or opening the file in `$EDITOR`.
 - `list` shows note ID, last modified timestamp, and title.
 - `view` prints the raw Markdown note content.
 - `delete` removes the note file from `notes/`.

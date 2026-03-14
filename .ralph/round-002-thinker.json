@@ -1,0 +1,3 @@
+{
+  "result": "Goal: add an `edit` command so existing notes can be updated after creation, either by replacing the body from the CLI or opening the note in `$EDITOR`.\n\nThis is the clearest next step because the app already supports create/list/view/delete, and editing is the biggest missing core workflow."
+}
