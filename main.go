@@ -35,6 +35,11 @@ type noteContent struct {
 	Body     string
 }
 
+type brokenLink struct {
+	Source string
+	Target string
+}
+
 type noteOptions struct {
 	Tags            []string
 	ClearTags       bool
@@ -77,6 +82,8 @@ func run(args []string) error {
 		return viewNote(args[1:])
 	case "delete", "rm":
 		return deleteNote(args[1:])
+	case "doctor":
+		return doctorNotes(args[1:])
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -326,6 +333,47 @@ func deleteNote(args []string) error {
 	}
 
 	fmt.Printf("deleted %s\n", args[0])
+	return nil
+}
+
+func doctorNotes(args []string) error {
+	if len(args) != 0 {
+		return errors.New("doctor does not take any arguments")
+	}
+
+	notes, err := loadNotes()
+	if err != nil {
+		return err
+	}
+
+	brokenLinks, orphanedNotes, err := inspectNotebook(notes)
+	if err != nil {
+		return err
+	}
+
+	if len(brokenLinks) == 0 && len(orphanedNotes) == 0 {
+		fmt.Println("doctor: no issues found")
+		return nil
+	}
+
+	if len(brokenLinks) > 0 {
+		fmt.Println("Broken links:")
+		for _, link := range brokenLinks {
+			fmt.Printf("- %s links to missing [[%s]]; fix the link or create %s\n", link.Source, link.Target, notePath(link.Target))
+		}
+	}
+
+	if len(orphanedNotes) > 0 {
+		if len(brokenLinks) > 0 {
+			fmt.Println()
+		}
+		fmt.Println("Orphaned notes:")
+		for _, id := range orphanedNotes {
+			fmt.Printf("- %s has no backlinks; add [[%s]] from a related note\n", id, id)
+		}
+	}
+
+	fmt.Printf("\nSummary: %d broken links, %d orphaned notes\n", len(brokenLinks), len(orphanedNotes))
 	return nil
 }
 
@@ -676,6 +724,59 @@ func findBacklinks(targetID string) ([]string, error) {
 	return backlinks, nil
 }
 
+func inspectNotebook(notes []noteMeta) ([]brokenLink, []string, error) {
+	noteSet := make(map[string]struct{}, len(notes))
+	backlinkCounts := make(map[string]int, len(notes))
+	linksByNote := make(map[string][]string, len(notes))
+	for _, note := range notes {
+		noteSet[note.ID] = struct{}{}
+	}
+
+	for _, note := range notes {
+		content, err := readNoteContent(notePath(note.ID))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		links := extractNoteLinks(content.Body)
+		linksByNote[note.ID] = links
+		for _, target := range links {
+			if target == note.ID {
+				continue
+			}
+			if _, ok := noteSet[target]; ok {
+				backlinkCounts[target]++
+			}
+		}
+	}
+
+	var brokenLinks []brokenLink
+	var orphanedNotes []string
+	for _, note := range notes {
+		for _, target := range linksByNote[note.ID] {
+			if _, ok := noteSet[target]; !ok {
+				brokenLinks = append(brokenLinks, brokenLink{
+					Source: note.ID,
+					Target: target,
+				})
+			}
+		}
+
+		if backlinkCounts[note.ID] == 0 {
+			orphanedNotes = append(orphanedNotes, note.ID)
+		}
+	}
+
+	sort.Slice(brokenLinks, func(i, j int) bool {
+		if brokenLinks[i].Source == brokenLinks[j].Source {
+			return brokenLinks[i].Target < brokenLinks[j].Target
+		}
+		return brokenLinks[i].Source < brokenLinks[j].Source
+	})
+	sort.Strings(orphanedNotes)
+	return brokenLinks, orphanedNotes, nil
+}
+
 func containsLink(links []string, targetID string) bool {
 	for _, link := range links {
 		if link == targetID {
@@ -892,4 +993,5 @@ func printUsage() {
 	fmt.Println("  today                     Create or open today's daily note")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  delete <id>               Delete a note")
+	fmt.Println("  doctor                    Check for broken wiki links and orphaned notes")
 }

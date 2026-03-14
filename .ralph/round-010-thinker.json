@@ -1,0 +1,3 @@
+{
+  "result": "Goal: add a `doctor` command that scans `notes/` for broken `[[note-id]]` links and orphaned notes, then reports actionable fixes.\n\nThis fits the project’s current state: the CLI already supports wiki-style links, backlinks, and rename-based link rewrites, so the next high-value step is notebook integrity checking."
+}

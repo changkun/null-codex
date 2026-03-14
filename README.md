@@ -21,6 +21,7 @@ go run . search shipped --include-archived
 go run . search --tag review
 go run . view daily-log
 go run . delete daily-log
+go run . doctor
 ```
 
 ## Behavior
@@ -34,6 +35,7 @@ go run . delete daily-log
 - `today` creates `notes/YYYY-MM-DD.md` when missing and opens today's daily note in `$EDITOR`.
 - `view` prints the raw Markdown note content.
 - `delete` removes the note file from `notes/`.
+- `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets.
 
 ## Note Format
 

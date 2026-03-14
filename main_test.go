@@ -523,6 +523,99 @@ func TestRunIncludesSearchCommand(t *testing.T) {
 	}
 }
 
+func TestDoctorNotesReportsBrokenLinksAndOrphans(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("hub"), []byte("# Hub\n\nLinks to [[known-note]] and [[missing-note]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("known-note"), []byte("# Known Note\n\nExisting body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("lonely-note"), []byte("# Lonely Note\n\nUnlinked body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := doctorNotes(nil); err != nil {
+			t.Fatalf("doctorNotes returned error: %v", err)
+		}
+	})
+
+	want := "Broken links:\n" +
+		"- hub links to missing [[missing-note]]; fix the link or create notes/missing-note.md\n\n" +
+		"Orphaned notes:\n" +
+		"- hub has no backlinks; add [[hub]] from a related note\n" +
+		"- lonely-note has no backlinks; add [[lonely-note]] from a related note\n\n" +
+		"Summary: 1 broken links, 2 orphaned notes\n"
+	if output != want {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestDoctorNotesPrintsCleanNotebook(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\n\nPoints at [[beta]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("beta"), []byte("# Beta\n\nPoints at [[alpha]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := doctorNotes(nil); err != nil {
+			t.Fatalf("doctorNotes returned error: %v", err)
+		}
+	})
+
+	if output != "doctor: no issues found\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestDoctorNotesRejectsArguments(t *testing.T) {
+	withTempDir(t)
+
+	err := doctorNotes([]string{"extra"})
+	if err == nil || err.Error() != "doctor does not take any arguments" {
+		t.Fatalf("expected argument error, got %v", err)
+	}
+}
+
+func TestRunIncludesDoctorCommand(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\n\nPoints at [[beta]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("beta"), []byte("# Beta\n\nPoints at [[alpha]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := run([]string{"doctor"}); err != nil {
+			t.Fatalf("run returned error: %v", err)
+		}
+	})
+
+	if output != "doctor: no issues found\n" {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
 func TestOpenTodayNoteCreatesDailyNote(t *testing.T) {
 	withTempDir(t)
 	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
