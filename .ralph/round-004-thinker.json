@@ -1,0 +1,3 @@
+{
+  "result": "Next goal: add a `today` command that creates or opens a date-based daily note (for example `2026-03-14.md`) so the CLI supports a fast journaling workflow instead of only manual title-based note management."
+}

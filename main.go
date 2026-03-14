@@ -15,6 +15,8 @@ import (
 
 const notesDir = "notes"
 
+var now = time.Now
+
 type noteMeta struct {
 	ID      string
 	Title   string
@@ -43,6 +45,8 @@ func run(args []string) error {
 		return listNotes()
 	case "search":
 		return searchNotes(args[1:])
+	case "today":
+		return openTodayNote()
 	case "view", "show":
 		return viewNote(args[1:])
 	case "delete", "rm":
@@ -146,6 +150,27 @@ func searchNotes(args []string) error {
 	}
 
 	return nil
+}
+
+func openTodayNote() error {
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		return err
+	}
+
+	today := now().Format("2006-01-02")
+	path := notePath(today)
+	if _, err := os.Stat(path); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+
+		content := formatNote(today, "")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			return err
+		}
+	}
+
+	return openInEditor(path)
 }
 
 func editNote(args []string) error {
@@ -354,6 +379,7 @@ func printUsage() {
 	fmt.Println("  edit <id> [content]       Replace note body or open in $EDITOR")
 	fmt.Println("  list                      List saved notes")
 	fmt.Println("  search <query>            Search note titles and bodies")
+	fmt.Println("  today                     Create or open today's daily note")
 	fmt.Println("  view <id>                 Print a note")
 	fmt.Println("  delete <id>               Delete a note")
 }

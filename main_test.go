@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -175,6 +176,80 @@ func TestRunIncludesSearchCommand(t *testing.T) {
 	}
 }
 
+func TestOpenTodayNoteCreatesDailyNote(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+	t.Setenv("EDITOR", "true")
+
+	if err := openTodayNote(); err != nil {
+		t.Fatalf("openTodayNote returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("2026-03-14"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != "# 2026-03-14\n\n" {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+}
+
+func TestOpenTodayNoteKeepsExistingBody(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	path := notePath("2026-03-14")
+	want := "# 2026-03-14\n\nExisting entry\n"
+	if err := os.WriteFile(path, []byte(want), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("EDITOR", "true")
+	if err := openTodayNote(); err != nil {
+		t.Fatalf("openTodayNote returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != want {
+		t.Fatalf("expected existing note to be preserved, got %q", string(got))
+	}
+}
+
+func TestRunIncludesTodayCommand(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	editorDir := t.TempDir()
+	editorArgPath := filepath.Join(editorDir, "editor-arg")
+	editorPath := filepath.Join(editorDir, "editor.sh")
+	if err := os.WriteFile(editorPath, []byte("#!/bin/sh\nprintf '%s' \"$1\" > \""+editorArgPath+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("EDITOR", editorPath)
+
+	if err := run([]string{"today"}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+
+	gotArg, err := os.ReadFile(editorArgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(gotArg) != notePath("2026-03-14") {
+		t.Fatalf("expected editor to receive today's note path, got %q", string(gotArg))
+	}
+}
+
 func withTempDir(t *testing.T) {
 	t.Helper()
 
@@ -218,4 +293,17 @@ func captureStdout(t *testing.T, fn func()) string {
 	}
 
 	return buf.String()
+}
+
+func setFixedNow(t *testing.T, ts time.Time) {
+	t.Helper()
+
+	previous := now
+	now = func() time.Time {
+		return ts
+	}
+
+	t.Cleanup(func() {
+		now = previous
+	})
 }
