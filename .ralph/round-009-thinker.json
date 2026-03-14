@@ -1,0 +1,3 @@
+{
+  "result": "Goal: make `rename` link-aware so renaming a note also updates every `[[old-id]]` reference across the `notes/` directory, preventing broken links after note IDs change."
+}

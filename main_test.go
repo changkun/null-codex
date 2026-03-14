@@ -737,6 +737,82 @@ func TestRenameNoteUpdatesListAndSearchDiscoverability(t *testing.T) {
 	}
 }
 
+func TestRenameNoteUpdatesLinkedReferencesAcrossNotes(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("daily-log"), []byte("# Daily Log\n\nSee [[daily-log]] and [[other-note]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("source-a"), []byte("# Source A\n\nPoints at [[daily-log]] twice: [[daily-log]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("source-b"), []byte("# Source B\nArchived: true\n\nKeeps spacing [[ daily-log ]] and ignores [[daily-log-2]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := renameNote([]string{"daily-log", "project-log"}); err != nil {
+		t.Fatalf("renameNote returned error: %v", err)
+	}
+
+	got, err := os.ReadFile(notePath("project-log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Daily Log\n\nSee [[project-log]] and [[other-note]].\n" {
+		t.Fatalf("unexpected renamed note contents: %q", string(got))
+	}
+
+	got, err = os.ReadFile(notePath("source-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Source A\n\nPoints at [[project-log]] twice: [[project-log]].\n" {
+		t.Fatalf("unexpected source-a contents: %q", string(got))
+	}
+
+	got, err = os.ReadFile(notePath("source-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "# Source B\nArchived: true\n\nKeeps spacing [[ project-log ]] and ignores [[daily-log-2]].\n" {
+		t.Fatalf("unexpected source-b contents: %q", string(got))
+	}
+}
+
+func TestRenameNoteUpdatesBacklinksAfterReferenceRewrite(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("target"), []byte("# Target\n\nBody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("source"), []byte("# Source\n\nPoints at [[target]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := renameNote([]string{"target", "renamed-target"}); err != nil {
+		t.Fatalf("renameNote returned error: %v", err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := viewNote([]string{"renamed-target"}); err != nil {
+			t.Fatalf("viewNote returned error: %v", err)
+		}
+	})
+
+	want := "# Target\n\nBody\n\nBacklinks: source\n"
+	if output != want {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
 func TestRenameNoteRejectsExistingTarget(t *testing.T) {
 	withTempDir(t)
 

@@ -358,6 +358,12 @@ func renameNote(args []string) error {
 	if err := os.Rename(oldPath, newPath); err != nil {
 		return err
 	}
+	if err := renameLinkedReferences(oldID, newID); err != nil {
+		if rollbackErr := os.Rename(newPath, oldPath); rollbackErr != nil {
+			return fmt.Errorf("update links after rename: %v (rollback failed: %v)", err, rollbackErr)
+		}
+		return err
+	}
 
 	fmt.Printf("renamed %s to %s\n", oldID, newID)
 	return nil
@@ -587,6 +593,61 @@ func extractNoteLinks(body string) []string {
 		links = append(links, id)
 	}
 	return links
+}
+
+func renameLinkedReferences(oldID, newID string) error {
+	entries, err := os.ReadDir(notesDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+
+		path := filepath.Join(notesDir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		updated := rewriteNoteLinks(string(data), oldID, newID)
+		if updated == string(data) {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, []byte(updated), info.Mode()); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func rewriteNoteLinks(content, oldID, newID string) string {
+	return noteLinkPattern.ReplaceAllStringFunc(content, func(match string) string {
+		parts := noteLinkPattern.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return match
+		}
+
+		target := parts[1]
+		if strings.TrimSpace(target) != oldID {
+			return match
+		}
+
+		leading := len(target) - len(strings.TrimLeftFunc(target, unicode.IsSpace))
+		trailing := len(target) - len(strings.TrimRightFunc(target, unicode.IsSpace))
+		return "[[" + target[:leading] + newID + target[len(target)-trailing:] + "]]"
+	})
 }
 
 func findBacklinks(targetID string) ([]string, error) {
@@ -825,7 +886,7 @@ func printUsage() {
 	fmt.Println("  edit <id> [content] [--tag <tag>] [--tags a,b]       Replace note body/tags or open in $EDITOR")
 	fmt.Println("  archive <id>                Mark a note as archived")
 	fmt.Println("  unarchive <id>              Remove archived status from a note")
-	fmt.Println("  rename <old-id> <new-id>    Rename a note file without changing its content")
+	fmt.Println("  rename <old-id> <new-id>    Rename a note file and rewrite matching note links")
 	fmt.Println("  list [--tag <tag>]... [--include-archived|--archived-only]   List saved notes")
 	fmt.Println("  search <query> [--tag <tag>]... [--include-archived|--archived-only] Search note titles and bodies")
 	fmt.Println("  today                     Create or open today's daily note")
