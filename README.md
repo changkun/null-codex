@@ -29,6 +29,7 @@ go run . backlinks daily-log
 go run . graph
 go run . delete daily-log
 go run . doctor
+go run . doctor --fix --report
 ```
 
 ## Behavior
@@ -46,7 +47,7 @@ go run . doctor
 - `backlinks` lists the note IDs that link to the requested note.
 - `graph` emits the notebook's `[[note-id]]` link structure as Graphviz DOT, including dashed nodes for missing link targets.
 - `delete` removes the note file from `notes/`.
-- `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets.
+- `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets. `doctor --fix` creates stub notes for missing link targets, and `--report` lists each created stub note.
 
 ## Note Format
 

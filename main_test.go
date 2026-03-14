@@ -695,6 +695,78 @@ func TestDoctorNotesReportsBrokenLinksAndOrphans(t *testing.T) {
 	}
 }
 
+func TestDoctorNotesFixCreatesStubNotes(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("hub"), []byte("# Hub\n\nLinks to [[known-note]] and [[missing-note]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("known-note"), []byte("# Known Note\n\nExisting body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("lonely-note"), []byte("# Lonely Note\n\nUnlinked body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := doctorNotes([]string{"--fix"}); err != nil {
+			t.Fatalf("doctorNotes returned error: %v", err)
+		}
+	})
+
+	want := "doctor: fixed 1 broken link by creating 1 stub note\n\n" +
+		"Orphaned notes:\n" +
+		"- hub has no backlinks; add [[hub]] from a related note\n" +
+		"- lonely-note has no backlinks; add [[lonely-note]] from a related note\n\n" +
+		"Summary: 0 broken links, 2 orphaned notes\n"
+	if output != want {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+
+	got, err := os.ReadFile(notePath("missing-note"))
+	if err != nil {
+		t.Fatalf("expected missing stub note to be created: %v", err)
+	}
+
+	wantNote := "# Missing Note\n\nStub note created by doctor --fix.\n"
+	if string(got) != wantNote {
+		t.Fatalf("unexpected stub note content: %q", got)
+	}
+}
+
+func TestDoctorNotesFixReportListsCreatedStubNotes(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("hub"), []byte("# Hub\n\nLinks to [[missing-a]], [[missing-b]], and [[missing-a]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := doctorNotes([]string{"--fix", "--report"}); err != nil {
+			t.Fatalf("doctorNotes returned error: %v", err)
+		}
+	})
+
+	want := "doctor: fixed 2 broken links by creating 2 stub notes\n" +
+		"Applied fixes:\n" +
+		"- created notes/missing-a.md for [[missing-a]]\n" +
+		"- created notes/missing-b.md for [[missing-b]]\n\n" +
+		"Orphaned notes:\n" +
+		"- hub has no backlinks; add [[hub]] from a related note\n\n" +
+		"Summary: 0 broken links, 1 orphaned notes\n"
+	if output != want {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
 func TestDoctorNotesPrintsCleanNotebook(t *testing.T) {
 	withTempDir(t)
 
@@ -724,7 +796,16 @@ func TestDoctorNotesRejectsArguments(t *testing.T) {
 	withTempDir(t)
 
 	err := doctorNotes([]string{"extra"})
-	if err == nil || err.Error() != "doctor does not take any arguments" {
+	if err == nil || err.Error() != "unknown doctor argument \"extra\"" {
+		t.Fatalf("expected argument error, got %v", err)
+	}
+}
+
+func TestDoctorNotesRejectsReportWithoutFix(t *testing.T) {
+	withTempDir(t)
+
+	err := doctorNotes([]string{"--report"})
+	if err == nil || err.Error() != "--report requires --fix" {
 		t.Fatalf("expected argument error, got %v", err)
 	}
 }

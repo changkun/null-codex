@@ -50,6 +50,11 @@ type noteEdge struct {
 	Target string
 }
 
+type doctorOptions struct {
+	Fix    bool
+	Report bool
+}
+
 type noteOptions struct {
 	Tags            []string
 	ClearTags       bool
@@ -532,8 +537,9 @@ func deleteNote(args []string) error {
 }
 
 func doctorNotes(args []string) error {
-	if len(args) != 0 {
-		return errors.New("doctor does not take any arguments")
+	opts, err := parseDoctorOptions(args)
+	if err != nil {
+		return err
 	}
 
 	notes, err := loadNotes()
@@ -546,29 +552,54 @@ func doctorNotes(args []string) error {
 		return err
 	}
 
+	initialBrokenCount := len(brokenLinks)
+	var created []string
+	if opts.Fix && len(brokenLinks) > 0 {
+		created, err = repairBrokenLinks(brokenLinks)
+		if err != nil {
+			return err
+		}
+		notes, err = loadNotes()
+		if err != nil {
+			return err
+		}
+		brokenLinks, orphanedNotes, err = inspectNotebook(notes)
+		if err != nil {
+			return err
+		}
+	}
+
 	if len(brokenLinks) == 0 && len(orphanedNotes) == 0 {
+		if len(created) > 0 {
+			fmt.Printf("doctor: fixed %d broken %s by creating %d stub %s\n",
+				initialBrokenCount,
+				pluralize(initialBrokenCount, "link", "links"),
+				len(created),
+				pluralize(len(created), "note", "notes"),
+			)
+			if opts.Report {
+				printDoctorFixes(created)
+			}
+			return nil
+		}
 		fmt.Println("doctor: no issues found")
 		return nil
 	}
 
-	if len(brokenLinks) > 0 {
-		fmt.Println("Broken links:")
-		for _, link := range brokenLinks {
-			fmt.Printf("- %s links to missing [[%s]]; fix the link or create %s\n", link.Source, link.Target, notePath(link.Target))
+	if len(created) > 0 {
+		fmt.Printf("doctor: fixed %d broken %s by creating %d stub %s\n",
+			initialBrokenCount,
+			pluralize(initialBrokenCount, "link", "links"),
+			len(created),
+			pluralize(len(created), "note", "notes"),
+		)
+		if opts.Report {
+			printDoctorFixes(created)
 		}
+		fmt.Println()
 	}
 
-	if len(orphanedNotes) > 0 {
-		if len(brokenLinks) > 0 {
-			fmt.Println()
-		}
-		fmt.Println("Orphaned notes:")
-		for _, id := range orphanedNotes {
-			fmt.Printf("- %s has no backlinks; add [[%s]] from a related note\n", id, id)
-		}
-	}
-
-	fmt.Printf("\nSummary: %d broken links, %d orphaned notes\n", len(brokenLinks), len(orphanedNotes))
+	printDoctorFindings(brokenLinks, orphanedNotes)
 	return nil
 }
 
@@ -1058,6 +1089,110 @@ func inspectNotebook(notes []noteMeta) ([]brokenLink, []string, error) {
 	return brokenLinks, orphanedNotes, nil
 }
 
+func parseDoctorOptions(args []string) (doctorOptions, error) {
+	var opts doctorOptions
+	for _, arg := range args {
+		switch arg {
+		case "--fix":
+			opts.Fix = true
+		case "--report":
+			opts.Report = true
+		default:
+			return doctorOptions{}, fmt.Errorf("unknown doctor argument %q", arg)
+		}
+	}
+	if opts.Report && !opts.Fix {
+		return doctorOptions{}, errors.New("--report requires --fix")
+	}
+	return opts, nil
+}
+
+func repairBrokenLinks(brokenLinks []brokenLink) ([]string, error) {
+	targetSet := make(map[string]struct{})
+	for _, link := range brokenLinks {
+		targetSet[link.Target] = struct{}{}
+	}
+
+	var targets []string
+	for target := range targetSet {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
+
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		return nil, err
+	}
+
+	for _, target := range targets {
+		content := noteContent{
+			Title: stubTitleFromID(target),
+			Body:  "Stub note created by doctor --fix.",
+		}
+		if err := os.WriteFile(notePath(target), []byte(formatNote(content)), 0o644); err != nil {
+			return nil, err
+		}
+	}
+
+	return targets, nil
+}
+
+func stubTitleFromID(id string) string {
+	parts := strings.FieldsFunc(id, func(r rune) bool {
+		return r == '-' || r == '_' || unicode.IsSpace(r)
+	})
+	if len(parts) == 0 {
+		return id
+	}
+
+	for i, part := range parts {
+		runes := []rune(strings.ToLower(part))
+		if len(runes) == 0 {
+			continue
+		}
+		runes[0] = unicode.ToUpper(runes[0])
+		parts[i] = string(runes)
+	}
+	return strings.Join(parts, " ")
+}
+
+func printDoctorFixes(created []string) {
+	fmt.Println("Applied fixes:")
+	for _, id := range created {
+		fmt.Printf("- created %s for [[%s]]\n", notePath(id), id)
+	}
+}
+
+func printDoctorFindings(brokenLinks []brokenLink, orphanedNotes []string) {
+	if len(brokenLinks) > 0 {
+		fmt.Println("Broken links:")
+		for _, link := range brokenLinks {
+			fmt.Printf("- %s links to missing [[%s]]; fix the link or create %s\n", link.Source, link.Target, notePath(link.Target))
+		}
+	}
+
+	if len(orphanedNotes) > 0 {
+		if len(brokenLinks) > 0 {
+			fmt.Println()
+		}
+		fmt.Println("Orphaned notes:")
+		for _, id := range orphanedNotes {
+			fmt.Printf("- %s has no backlinks; add [[%s]] from a related note\n", id, id)
+		}
+	}
+
+	fmt.Printf("\nSummary: %d broken links, %d orphaned notes\n", len(brokenLinks), len(orphanedNotes))
+}
+
+func pluralize(count int, singular, plural string) string {
+	if count == 1 {
+		return singular
+	}
+	return plural
+}
+
 func dotQuote(value string) string {
 	escaped := strings.ReplaceAll(value, `\`, `\\`)
 	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
@@ -1448,5 +1583,5 @@ func printUsage() {
 	fmt.Println("  backlinks <id>            List notes that link to a note")
 	fmt.Println("  graph                     Emit the notebook link graph as Graphviz DOT")
 	fmt.Println("  delete <id>               Delete a note")
-	fmt.Println("  doctor                    Check for broken wiki links and orphaned notes")
+	fmt.Println("  doctor [--fix] [--report] Check for broken wiki links and orphaned notes")
 }

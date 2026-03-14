@@ -1,0 +1,3 @@
+{
+  "result": "Goal: implement a `doctor --fix` workflow that can automatically create stub notes for broken `[[note-id]]` links and optionally report each fix, turning the existing diagnostics into a repair tool."
+}
