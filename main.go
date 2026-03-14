@@ -35,6 +35,11 @@ type noteContent struct {
 	Body     string
 }
 
+type searchResult struct {
+	Note    noteMeta
+	Snippet string
+}
+
 type brokenLink struct {
 	Source string
 	Target string
@@ -177,21 +182,27 @@ func searchNotes(args []string) error {
 	notes = filterNotesByTags(notes, opts.Tags)
 	notes = filterArchivedNotes(notes, opts)
 	query := strings.ToLower(opts.Body)
-	var matches []noteMeta
+	var matches []searchResult
 	for _, note := range notes {
-		if query == "" {
-			matches = append(matches, note)
-			continue
-		}
-
-		body, err := os.ReadFile(notePath(note.ID))
+		content, err := readNoteContent(notePath(note.ID))
 		if err != nil {
 			return err
 		}
 
-		searchText := strings.ToLower(note.Title + "\n" + string(body))
+		if query == "" {
+			matches = append(matches, searchResult{
+				Note:    note,
+				Snippet: buildSearchSnippet(content.Body, query),
+			})
+			continue
+		}
+
+		searchText := strings.ToLower(note.Title + "\n" + content.Body)
 		if strings.Contains(searchText, query) {
-			matches = append(matches, note)
+			matches = append(matches, searchResult{
+				Note:    note,
+				Snippet: buildSearchSnippet(content.Body, query),
+			})
 		}
 	}
 
@@ -200,11 +211,82 @@ func searchNotes(args []string) error {
 		return nil
 	}
 
-	for _, note := range matches {
-		fmt.Printf("%s\t%s\t%s\t%s\n", note.ID, note.ModTime.Format(time.RFC3339), note.Title, formatTags(note.Tags))
+	for _, match := range matches {
+		fmt.Printf("%s\t%s\t%s\t%s\t%s\n",
+			match.Note.ID,
+			match.Note.ModTime.Format(time.RFC3339),
+			match.Note.Title,
+			formatTags(match.Note.Tags),
+			match.Snippet,
+		)
 	}
 
 	return nil
+}
+
+func buildSearchSnippet(body, query string) string {
+	lines := strings.Split(body, "\n")
+	if query != "" {
+		for _, line := range lines {
+			index := strings.Index(strings.ToLower(line), query)
+			if index >= 0 {
+				return clipSearchSnippet(line, index, len(query))
+			}
+		}
+	}
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			return clipSearchSnippet(line, -1, 0)
+		}
+	}
+
+	return "-"
+}
+
+func clipSearchSnippet(line string, matchStart, matchLen int) string {
+	line = normalizeSearchSnippetWhitespace(line)
+	if line == "" {
+		return "-"
+	}
+
+	const maxSnippetLen = 80
+	const matchContext = 30
+
+	if len(line) <= maxSnippetLen {
+		return line
+	}
+
+	start := 0
+	if matchStart >= 0 {
+		start = matchStart - matchContext
+		if start < 0 {
+			start = 0
+		}
+	}
+	end := start + maxSnippetLen
+	if end > len(line) {
+		end = len(line)
+		start = max(0, end-maxSnippetLen)
+	}
+	if matchStart >= 0 && matchStart+matchLen > end {
+		end = min(len(line), matchStart+matchLen+matchContext)
+		start = max(0, end-maxSnippetLen)
+	}
+
+	snippet := strings.TrimSpace(line[start:end])
+	if start > 0 {
+		snippet = "..." + snippet
+	}
+	if end < len(line) {
+		snippet += "..."
+	}
+	return snippet
+}
+
+func normalizeSearchSnippetWhitespace(line string) string {
+	line = strings.ReplaceAll(line, "\t", " ")
+	return strings.Join(strings.Fields(line), " ")
 }
 
 func openTodayNote() error {

@@ -1,0 +1,3 @@
+{
+  "result": "Goal: add contextual search result snippets to `search` so each match shows the relevant line or excerpt from the note body instead of only note metadata."
+}

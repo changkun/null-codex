@@ -320,9 +320,15 @@ func TestSearchNotesMatchesTitleAndBody(t *testing.T) {
 	if !strings.Contains(lines[0], "review") {
 		t.Fatalf("expected tag column in output, got %q", lines[0])
 	}
+	if !strings.Contains(lines[0], "Search indexing can wait.") {
+		t.Fatalf("expected matching body snippet in output, got %q", lines[0])
+	}
 
 	if !strings.Contains(lines[1], "project-ideas") || !strings.Contains(lines[1], "Project Ideas") {
 		t.Fatalf("expected older note second, got %q", lines[1])
+	}
+	if !strings.Contains(lines[1], "Build a search command.") {
+		t.Fatalf("expected matching body snippet in output, got %q", lines[1])
 	}
 }
 
@@ -363,6 +369,9 @@ func TestSearchNotesCanFilterByTagOnly(t *testing.T) {
 	if !strings.Contains(lines[0], "project-ideas") || !strings.Contains(lines[0], "work,writing") {
 		t.Fatalf("unexpected search output: %q", lines[0])
 	}
+	if !strings.Contains(lines[0], "Build docs.") {
+		t.Fatalf("expected body snippet in output, got %q", lines[0])
+	}
 }
 
 func TestSearchNotesAppliesTagFilterAlongsideQuery(t *testing.T) {
@@ -392,6 +401,9 @@ func TestSearchNotesAppliesTagFilterAlongsideQuery(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], "project-ideas") {
 		t.Fatalf("unexpected search output: %q", lines[0])
+	}
+	if !strings.Contains(lines[0], "Build a search command.") {
+		t.Fatalf("expected matching body snippet in output, got %q", lines[0])
 	}
 }
 
@@ -520,6 +532,34 @@ func TestRunIncludesSearchCommand(t *testing.T) {
 
 	if !strings.Contains(output, "daily-log") || !strings.Contains(output, "Daily Log") {
 		t.Fatalf("expected search output to include matching note, got %q", output)
+	}
+	if !strings.Contains(output, "Implemented search today.") {
+		t.Fatalf("expected search output to include matching body snippet, got %q", output)
+	}
+}
+
+func TestSearchNotesSnippetUsesParsedBodyInsteadOfMetadata(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("release-plan"), []byte("# Release Plan\nTags: search\nArchived: true\n\nShip the body excerpt.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := searchNotes([]string{"search", "--include-archived"}); err != nil {
+			t.Fatalf("searchNotes returned error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "Ship the body excerpt.") {
+		t.Fatalf("expected snippet from note body, got %q", output)
+	}
+	if strings.Contains(output, "Archived: true") {
+		t.Fatalf("expected metadata to be excluded from snippet, got %q", output)
 	}
 }
 
