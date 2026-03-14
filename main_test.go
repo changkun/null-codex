@@ -729,6 +729,82 @@ func TestDoctorNotesRejectsArguments(t *testing.T) {
 	}
 }
 
+func TestGraphNotesPrintsDOT(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("hub"), []byte("# Hub\n\nLinks to [[beta]] and [[missing-note]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("beta"), []byte("# Beta\n\nPoints at [[hub]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("lonely-note"), []byte("# Lonely Note\n\nNo links here.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := graphNotes(nil); err != nil {
+			t.Fatalf("graphNotes returned error: %v", err)
+		}
+	})
+
+	want := "digraph notes {\n" +
+		"  \"beta\";\n" +
+		"  \"hub\";\n" +
+		"  \"lonely-note\";\n" +
+		"  \"missing-note\" [style=dashed];\n" +
+		"  \"beta\" -> \"hub\";\n" +
+		"  \"hub\" -> \"beta\";\n" +
+		"  \"hub\" -> \"missing-note\";\n" +
+		"}\n"
+	if output != want {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
+func TestGraphNotesRejectsArguments(t *testing.T) {
+	withTempDir(t)
+
+	err := graphNotes([]string{"extra"})
+	if err == nil || err.Error() != "graph does not take any arguments" {
+		t.Fatalf("expected argument error, got %v", err)
+	}
+}
+
+func TestRunIncludesGraphCommand(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\n\nPoints at [[beta]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("beta"), []byte("# Beta\n\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureStdout(t, func() {
+		if err := run([]string{"graph"}); err != nil {
+			t.Fatalf("run returned error: %v", err)
+		}
+	})
+
+	want := "digraph notes {\n" +
+		"  \"alpha\";\n" +
+		"  \"beta\";\n" +
+		"  \"alpha\" -> \"beta\";\n" +
+		"}\n"
+	if output != want {
+		t.Fatalf("unexpected stdout: %q", output)
+	}
+}
+
 func TestRunIncludesDoctorCommand(t *testing.T) {
 	withTempDir(t)
 

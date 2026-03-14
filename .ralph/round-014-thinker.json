@@ -1,0 +1,3 @@
+{
+  "result": "Add a `graph` command that emits the notebook’s `[[note-id]]` link structure as Graphviz DOT, so users can visualize relationships between notes instead of only inspecting `links`, `backlinks`, and `doctor` one note at a time."
+}
