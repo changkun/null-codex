@@ -48,7 +48,7 @@ go run . doctor --fix --report
 - `links` lists the note IDs referenced by `[[note-id]]` links in a note body.
 - `backlinks` lists the note IDs that link to the requested note.
 - `graph` emits the notebook's `[[note-id]]` link structure as Graphviz DOT, including dashed nodes for missing link targets.
-- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, and lets you filter the notebook by tag.
+- `serve` starts a local web UI that renders Markdown notes, rewrites `[[note-id]]` references into clickable note pages, shows backlinks and broken-link warnings, lets you filter the notebook by tag, and now supports creating and editing notes directly in the browser.
 - `delete` removes the note file from `notes/`.
 - `doctor` scans the notebook graph, reports broken `[[note-id]]` links, and flags notes with no backlinks so you can add links or create missing targets. `doctor --fix` creates stub notes for missing link targets, and `--report` lists each created stub note.
 

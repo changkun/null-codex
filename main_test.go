@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1617,6 +1618,131 @@ func TestServeNotePageReturnsNotFoundForMissingNote(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
+func TestServeCreateNotePageRendersForm(t *testing.T) {
+	withTempDir(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/new", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `<form class="form-grid" method="post" action="/notes">`) {
+		t.Fatalf("expected create form, got %q", body)
+	}
+	if !strings.Contains(body, "Create note") {
+		t.Fatalf("expected create action text, got %q", body)
+	}
+}
+
+func TestServeCreateNotePostCreatesNote(t *testing.T) {
+	withTempDir(t)
+
+	form := url.Values{
+		"title":    {"Browser Draft"},
+		"tags":     {"Work, Writing"},
+		"body":     {"Draft from the browser.\nWith a second line."},
+		"archived": {"1"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/notes", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get("Location"); location != "/notes/browser-draft" {
+		t.Fatalf("unexpected redirect target: %q", location)
+	}
+
+	got, err := os.ReadFile(notePath("browser-draft"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# Browser Draft\nTags: work, writing\nArchived: true\n\nDraft from the browser.\nWith a second line.\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
+	}
+}
+
+func TestServeEditNotePageRendersExistingContent(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\nArchived: true\n\nBody text.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/notes/alpha/edit", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `action="/notes/alpha"`) {
+		t.Fatalf("expected edit form action, got %q", body)
+	}
+	if !strings.Contains(body, `value="Alpha"`) || !strings.Contains(body, `value="work"`) {
+		t.Fatalf("expected existing title and tags, got %q", body)
+	}
+	if !strings.Contains(body, ">Body text.</textarea>") {
+		t.Fatalf("expected existing body, got %q", body)
+	}
+	if !strings.Contains(body, `name="archived" type="checkbox" value="1" checked`) {
+		t.Fatalf("expected archived checkbox to be checked, got %q", body)
+	}
+}
+
+func TestServeUpdateNotePostEditsNote(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\nArchived: true\n\nOld body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	form := url.Values{
+		"title": {"Alpha Revised"},
+		"tags":  {"home, urgent"},
+		"body":  {"Updated body with [[beta]]."},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/notes/alpha", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
+	}
+	if location := rec.Header().Get("Location"); location != "/notes/alpha" {
+		t.Fatalf("unexpected redirect target: %q", location)
+	}
+
+	got, err := os.ReadFile(notePath("alpha"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# Alpha Revised\nTags: home, urgent\n\nUpdated body with [[beta]].\n"
+	if string(got) != want {
+		t.Fatalf("unexpected file contents: %q", string(got))
 	}
 }
 

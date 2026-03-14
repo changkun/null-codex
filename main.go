@@ -97,6 +97,7 @@ type notebookPageData struct {
 	IncludeArchived bool
 	Notes           []webNoteSummary
 	CurrentNote     *webNoteDetail
+	NoteForm        *webNoteForm
 }
 
 type webNoteSummary struct {
@@ -122,6 +123,18 @@ type webNoteDetail struct {
 	Backlinks         []webLink
 	BrokenLinks       []string
 	OutgoingLinksText string
+}
+
+type webNoteForm struct {
+	Title       string
+	Tags        string
+	Body        string
+	Archived    bool
+	ActionURL   string
+	CancelURL   string
+	SubmitLabel string
+	Error       string
+	IsEditing   bool
 }
 
 type webLink struct {
@@ -599,6 +612,8 @@ func serveNotes(args []string) error {
 func newServeMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveIndexPage)
+	mux.HandleFunc("/new", serveCreateNotePage)
+	mux.HandleFunc("/notes", serveCreateNote)
 	mux.HandleFunc("/notes/", serveNotePage)
 	return mux
 }
@@ -628,9 +643,81 @@ func serveIndexPage(w http.ResponseWriter, r *http.Request) {
 	renderNotebookPage(w, data)
 }
 
+func serveCreateNotePage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/new" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snapshot, err := buildNotebookSnapshot()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data := notebookPageData{
+		Title:           "New Note",
+		HeaderTitle:     "New Note",
+		HeaderSubtitle:  "Create a notebook entry in the browser",
+		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
+		AvailableTags:   snapshot.Tags,
+		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		NoteForm: &webNoteForm{
+			ActionURL:   "/notes",
+			CancelURL:   "/",
+			SubmitLabel: "Create note",
+		},
+	}
+	renderNotebookPage(w, data)
+}
+
+func serveCreateNote(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/notes" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	form := webNoteForm{
+		Title:       strings.TrimSpace(r.FormValue("title")),
+		Tags:        strings.TrimSpace(r.FormValue("tags")),
+		Body:        normalizeWebBody(r.FormValue("body")),
+		Archived:    r.FormValue("archived") != "",
+		ActionURL:   "/notes",
+		CancelURL:   "/",
+		SubmitLabel: "Create note",
+	}
+
+	id, err := createWebNote(form)
+	if err != nil {
+		renderWebFormError(w, r, http.StatusBadRequest, "New Note", "Create a notebook entry in the browser", form, err)
+		return
+	}
+
+	http.Redirect(w, r, noteURL(id), http.StatusSeeOther)
+}
+
 func serveNotePage(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/notes/")
-	id = strings.TrimSpace(strings.Trim(id, "/"))
+	path := strings.TrimPrefix(r.URL.Path, "/notes/")
+	path = strings.TrimSpace(strings.Trim(path, "/"))
+	isEditRoute := strings.HasSuffix(path, "/edit")
+	if isEditRoute {
+		path = strings.TrimSpace(strings.TrimSuffix(path, "/edit"))
+	}
+	id := path
 	unescapedID, err := url.PathUnescape(id)
 	if err != nil {
 		http.NotFound(w, r)
@@ -639,6 +726,24 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 	id = unescapedID
 	if id == "" {
 		http.NotFound(w, r)
+		return
+	}
+
+	if isEditRoute {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		serveEditNotePage(w, r, id)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		serveUpdateNote(w, r, id)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -668,10 +773,102 @@ func serveNotePage(w http.ResponseWriter, r *http.Request) {
 }
 
 func renderNotebookPage(w http.ResponseWriter, data notebookPageData) {
+	renderNotebookPageStatus(w, http.StatusOK, data)
+}
+
+func renderNotebookPageStatus(w http.ResponseWriter, status int, data notebookPageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	if err := notebookPageTemplate().Execute(w, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
+}
+
+func serveEditNotePage(w http.ResponseWriter, r *http.Request, id string) {
+	snapshot, err := buildNotebookSnapshot()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	detail, ok := snapshot.RenderedNotes[id]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	content, err := readNoteContent(notePath(id))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data := notebookPageData{
+		Title:           "Edit " + detail.Title,
+		HeaderTitle:     "Edit Note",
+		HeaderSubtitle:  id,
+		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
+		AvailableTags:   snapshot.Tags,
+		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		NoteForm: &webNoteForm{
+			Title:       content.Title,
+			Tags:        strings.Join(content.Tags, ", "),
+			Body:        content.Body,
+			Archived:    content.Archived,
+			ActionURL:   noteURL(id),
+			CancelURL:   noteURL(id),
+			SubmitLabel: "Save changes",
+			IsEditing:   true,
+		},
+	}
+	renderNotebookPage(w, data)
+}
+
+func serveUpdateNote(w http.ResponseWriter, r *http.Request, id string) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	form := webNoteForm{
+		Title:       strings.TrimSpace(r.FormValue("title")),
+		Tags:        strings.TrimSpace(r.FormValue("tags")),
+		Body:        normalizeWebBody(r.FormValue("body")),
+		Archived:    r.FormValue("archived") != "",
+		ActionURL:   noteURL(id),
+		CancelURL:   noteURL(id),
+		SubmitLabel: "Save changes",
+		IsEditing:   true,
+	}
+
+	if err := updateWebNote(id, form); err != nil {
+		renderWebFormError(w, r, http.StatusBadRequest, "Edit Note", id, form, err)
+		return
+	}
+
+	http.Redirect(w, r, noteURL(id), http.StatusSeeOther)
+}
+
+func renderWebFormError(w http.ResponseWriter, r *http.Request, status int, headerTitle, headerSubtitle string, form webNoteForm, err error) {
+	snapshot, snapshotErr := buildNotebookSnapshot()
+	if snapshotErr != nil {
+		http.Error(w, snapshotErr.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	form.Error = err.Error()
+	data := notebookPageData{
+		Title:           headerTitle,
+		HeaderTitle:     headerTitle,
+		HeaderSubtitle:  headerSubtitle,
+		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
+		AvailableTags:   snapshot.Tags,
+		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		NoteForm:        &form,
+	}
+	renderNotebookPageStatus(w, status, data)
 }
 
 func deleteNote(args []string) error {
@@ -1397,6 +1594,10 @@ func noteURL(id string) string {
 	return "/notes/" + url.PathEscape(id)
 }
 
+func noteEditURL(id string) string {
+	return noteURL(id) + "/edit"
+}
+
 func tagURL(tag string, includeArchived bool) string {
 	values := url.Values{}
 	values.Set("tag", tag)
@@ -1833,6 +2034,62 @@ func formatTags(tags []string) string {
 	return strings.Join(tags, ",")
 }
 
+func normalizeWebBody(body string) string {
+	body = strings.ReplaceAll(body, "\r\n", "\n")
+	return strings.TrimRight(body, "\n")
+}
+
+func parseWebTags(tags string) []string {
+	return normalizeTags(strings.FieldsFunc(tags, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	}))
+}
+
+func createWebNote(form webNoteForm) (string, error) {
+	id, content, err := buildNoteFromOptions(createOptions{
+		Title: form.Title,
+		noteOptions: noteOptions{
+			Tags: parseWebTags(form.Tags),
+			Body: form.Body,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	content.Archived = form.Archived
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(notePath(id), []byte(formatNote(content)), 0o644); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func updateWebNote(id string, form webNoteForm) error {
+	path := notePath(id)
+	content, err := readNoteContent(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("note %q not found", id)
+		}
+		return err
+	}
+
+	title := strings.TrimSpace(form.Title)
+	if title == "" {
+		return errors.New("title cannot be empty")
+	}
+
+	content.Title = title
+	content.Tags = parseWebTags(form.Tags)
+	content.Body = form.Body
+	content.Archived = form.Archived
+
+	return os.WriteFile(path, []byte(formatNote(content)), 0o644)
+}
+
 func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML {
 	lines := strings.Split(body, "\n")
 	var b strings.Builder
@@ -1937,6 +2194,7 @@ func notebookPageTemplate() *template.Template {
 	return template.Must(template.New("notebook").Funcs(template.FuncMap{
 		"tagURL":      tagURL,
 		"clearTagURL": clearTagURL,
+		"noteEditURL": noteEditURL,
 	}).Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -1978,6 +2236,17 @@ func notebookPageTemplate() *template.Template {
     .archived { color:var(--warn); font-weight:600; }
     .toolbar { margin:1rem 0 0; display:flex; gap:0.6rem; flex-wrap:wrap; }
     .toggle { text-decoration:none; font-size:0.9rem; color:var(--accent); }
+    .button { display:inline-flex; align-items:center; justify-content:center; padding:0.6rem 0.95rem; border-radius:999px; border:1px solid var(--accent); background:var(--accent); color:#fff; text-decoration:none; font-size:0.92rem; cursor:pointer; }
+    .button.secondary { background:transparent; color:var(--accent); }
+    .actions { margin-top:1rem; display:flex; gap:0.6rem; flex-wrap:wrap; }
+    .form-grid { display:grid; gap:1rem; margin-top:1.25rem; }
+    .field { display:grid; gap:0.4rem; }
+    .field label { font-weight:600; }
+    .field input[type="text"], .field textarea { width:100%; padding:0.75rem 0.85rem; border-radius:12px; border:1px solid var(--line); background:#fff; color:var(--ink); font:inherit; }
+    .field textarea { min-height:320px; resize:vertical; font-family: "SFMono-Regular", Consolas, monospace; font-size:0.95rem; line-height:1.5; }
+    .field .hint { color:var(--muted); font-size:0.85rem; }
+    .checkbox { display:flex; align-items:center; gap:0.55rem; }
+    .form-actions { display:flex; gap:0.75rem; flex-wrap:wrap; }
     @media (max-width: 880px) {
       .layout { grid-template-columns: 1fr; }
       .sidebar { border-right:none; border-bottom:1px solid var(--line); }
@@ -1999,6 +2268,7 @@ func notebookPageTemplate() *template.Template {
           {{end}}
         </div>
         <div class="toolbar">
+          <a class="button secondary" href="/new">New note</a>
           {{if .IncludeArchived}}
             <a class="toggle" href="{{if .ActiveTag}}{{tagURL .ActiveTag false}}{{else}}/{{end}}">Hide archived</a>
           {{else}}
@@ -2024,10 +2294,43 @@ func notebookPageTemplate() *template.Template {
     </aside>
     <main class="content">
       <div class="panel">
-        {{if .CurrentNote}}
+        {{if .NoteForm}}
+          <div class="eyebrow">{{if .NoteForm.IsEditing}}Editing{{else}}Create{{end}}</div>
+          <h1>{{.HeaderTitle}}</h1>
+          <p>{{.HeaderSubtitle}}</p>
+          {{if .NoteForm.Error}}
+            <div class="warning">{{.NoteForm.Error}}</div>
+          {{end}}
+          <form class="form-grid" method="post" action="{{.NoteForm.ActionURL}}">
+            <div class="field">
+              <label for="title">Title</label>
+              <input id="title" name="title" type="text" value="{{.NoteForm.Title}}" required>
+            </div>
+            <div class="field">
+              <label for="tags">Tags</label>
+              <input id="tags" name="tags" type="text" value="{{.NoteForm.Tags}}">
+              <div class="hint">Comma-separated tags. They will be normalized to notebook tag IDs.</div>
+            </div>
+            <div class="field">
+              <label for="body">Markdown</label>
+              <textarea id="body" name="body">{{.NoteForm.Body}}</textarea>
+            </div>
+            <label class="checkbox" for="archived">
+              <input id="archived" name="archived" type="checkbox" value="1" {{if .NoteForm.Archived}}checked{{end}}>
+              <span>Archived</span>
+            </label>
+            <div class="form-actions">
+              <button class="button" type="submit">{{.NoteForm.SubmitLabel}}</button>
+              <a class="button secondary" href="{{.NoteForm.CancelURL}}">Cancel</a>
+            </div>
+          </form>
+        {{else if .CurrentNote}}
           <div class="eyebrow">{{.CurrentNote.ID}}</div>
           <h1>{{.CurrentNote.Title}}</h1>
           <div class="meta">{{.CurrentNote.ModTime}}{{if .CurrentNote.Archived}} · <span class="archived">archived</span>{{end}}</div>
+          <div class="actions">
+            <a class="button secondary" href="{{noteEditURL .CurrentNote.ID}}">Edit note</a>
+          </div>
           {{if .CurrentNote.Tags}}
             <div class="meta" style="margin-top:0.75rem;">
               {{range .CurrentNote.Tags}}<span class="tag">#{{.}}</span>{{end}}
@@ -2066,6 +2369,9 @@ func notebookPageTemplate() *template.Template {
           <div class="eyebrow">Notebook</div>
           <h1>Rendered notes</h1>
           <p>Select a note from the left to browse rendered Markdown, follow wiki links, inspect backlinks, and catch broken references.</p>
+          <div class="actions">
+            <a class="button" href="/new">Create a note</a>
+          </div>
         {{end}}
       </div>
     </main>
