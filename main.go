@@ -122,11 +122,13 @@ type notebookPageData struct {
 	FilterPage      string
 	ShowTasks       bool
 	TasksPageURL    string
+	JournalPageURL  string
 	Notes           []webNoteSummary
 	TaskGroups      []webTaskGroup
 	CurrentNote     *webNoteDetail
 	NoteHistory     *webNoteHistory
 	NoteForm        *webNoteForm
+	Journal         *webJournalView
 	LiveReload      bool
 }
 
@@ -232,12 +234,36 @@ type webFilterOptions struct {
 	ArchivedMode string
 }
 
+type webJournalView struct {
+	MonthLabel        string
+	SelectedDate      string
+	SelectedDateLabel string
+	TodayURL          string
+	PrevMonthURL      string
+	NextMonthURL      string
+	Days              []webJournalDay
+	HasEntry          bool
+	SelectedNoteURL   string
+}
+
+type webJournalDay struct {
+	Date           string
+	DayOfMonth     int
+	WeekdayLabel   string
+	IsCurrentMonth bool
+	IsToday        bool
+	IsSelected     bool
+	HasEntry       bool
+	BrowseURL      string
+}
+
 type notebookSnapshot struct {
 	Notes         []webNoteSummary
 	NotesByID     map[string]webNoteSummary
 	RenderedNotes map[string]webNoteDetail
 	TaskGroups    []webTaskGroup
 	Tags          []string
+	JournalNotes  map[string]webNoteSummary
 }
 
 type notebookServer struct {
@@ -876,6 +902,7 @@ func newServeMux(server *notebookServer) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", server.serveIndexPage)
 	mux.HandleFunc("/events", server.serveEvents)
+	mux.HandleFunc("/journal", server.serveJournalPage)
 	mux.HandleFunc("/tasks/toggle", server.serveToggleTask)
 	mux.HandleFunc("/tasks", server.serveTasksPage)
 	mux.HandleFunc("/new", server.serveCreateNotePage)
@@ -952,10 +979,57 @@ func (s *notebookServer) serveIndexPage(w http.ResponseWriter, r *http.Request) 
 		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
+		JournalPageURL:  journalURL(defaultJournalDate()),
 		LiveReload:      s.watch,
 	}
 
 	data.Notes = notes
+	renderNotebookPage(w, data)
+}
+
+func (s *notebookServer) serveJournalPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/journal" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snapshot, err := s.currentSnapshot()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	filter := parseWebFilterOptions(r.URL.Query())
+	selectedDate, err := parseJournalDate(r.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	journal := buildJournalView(selectedDate, snapshot.JournalNotes)
+
+	data := notebookPageData{
+		Title:           "Journal",
+		HeaderTitle:     "Journal",
+		HeaderSubtitle:  journal.SelectedDateLabel,
+		SearchQuery:     filter.Query,
+		FilterTagsInput: filter.TagsInput,
+		ActiveTags:      append([]string(nil), filter.Tags...),
+		TagFilters:      buildTagFilters("/", snapshot.Tags, filter),
+		ArchivedMode:    filter.ArchivedMode,
+		ClearTagsURL:    clearTagFiltersURL("/", filter),
+		FilterPage:      "/",
+		TasksPageURL:    tasksURL(filter),
+		JournalPageURL:  journalURL(selectedDate),
+		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
+		Journal:         &journal,
+		LiveReload:      s.watch,
+	}
+	if detail, ok := snapshot.RenderedNotes[journal.SelectedDate]; ok {
+		data.CurrentNote = &detail
+	}
 	renderNotebookPage(w, data)
 }
 
@@ -1035,6 +1109,7 @@ func (s *notebookServer) serveTasksPage(w http.ResponseWriter, r *http.Request) 
 		FilterPage:      "/tasks",
 		ShowTasks:       true,
 		TasksPageURL:    tasksURL(filter),
+		JournalPageURL:  journalURL(defaultJournalDate()),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		TaskGroups:      taskGroups,
 		LiveReload:      s.watch,
@@ -1105,6 +1180,7 @@ func (s *notebookServer) serveCreateNotePage(w http.ResponseWriter, r *http.Requ
 		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
+		JournalPageURL:  journalURL(defaultJournalDate()),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		NoteForm: &webNoteForm{
 			ActionURL:   "/notes",
@@ -1238,6 +1314,7 @@ func (s *notebookServer) serveNotePage(w http.ResponseWriter, r *http.Request) {
 		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
+		JournalPageURL:  journalURL(defaultJournalDate()),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		CurrentNote:     &detail,
 		LiveReload:      s.watch,
@@ -1295,6 +1372,7 @@ func (s *notebookServer) serveNoteHistoryPage(w http.ResponseWriter, r *http.Req
 		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
+		JournalPageURL:  journalURL(defaultJournalDate()),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		CurrentNote:     &detail,
 		NoteHistory:     history,
@@ -1334,6 +1412,7 @@ func (s *notebookServer) serveEditNotePage(w http.ResponseWriter, r *http.Reques
 		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
+		JournalPageURL:  journalURL(defaultJournalDate()),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		NoteForm: &webNoteForm{
 			Title:       content.Title,
@@ -1427,6 +1506,7 @@ func (s *notebookServer) renderWebFormError(w http.ResponseWriter, r *http.Reque
 		ClearTagsURL:    clearTagFiltersURL("/", filter),
 		FilterPage:      "/",
 		TasksPageURL:    tasksURL(filter),
+		JournalPageURL:  journalURL(defaultJournalDate()),
 		Notes:           filterSnapshotNotes(snapshot.Notes, filter),
 		NoteForm:        &form,
 		LiveReload:      false,
@@ -2214,6 +2294,7 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 	snapshot := notebookSnapshot{
 		NotesByID:     make(map[string]webNoteSummary, len(notes)),
 		RenderedNotes: make(map[string]webNoteDetail, len(notes)),
+		JournalNotes:  make(map[string]webNoteSummary),
 		Tags:          tags,
 	}
 	for _, note := range notes {
@@ -2254,6 +2335,9 @@ func buildNotebookSnapshot() (notebookSnapshot, error) {
 		snapshot.Notes = append(snapshot.Notes, summary)
 		snapshot.NotesByID[note.ID] = summary
 		snapshot.RenderedNotes[note.ID] = detail
+		if _, ok := parseJournalNoteID(note.ID); ok {
+			snapshot.JournalNotes[note.ID] = summary
+		}
 		if tasks := openTasksFromContent(content); len(tasks) > 0 {
 			group := webTaskGroup{
 				ID:        note.ID,
@@ -2441,6 +2525,12 @@ func filterPageURL(page string, filter webFilterOptions) string {
 	return page + filterQueryString(filter, true)
 }
 
+func journalURL(date time.Time) string {
+	values := url.Values{}
+	values.Set("date", dateOnly(date).Format("2006-01-02"))
+	return "/journal?" + values.Encode()
+}
+
 func filterQueryString(filter webFilterOptions, includeQuery bool) string {
 	values := url.Values{}
 	if includeQuery && filter.Query != "" {
@@ -2508,6 +2598,97 @@ func safeReturnURL(raw, fallback string) string {
 
 func notebookSubtitle(count int) string {
 	return fmt.Sprintf("%d %s", count, pluralize(count, "note", "notes"))
+}
+
+func defaultJournalDate() time.Time {
+	return dateOnly(now())
+}
+
+func parseJournalDate(values url.Values) (time.Time, error) {
+	raw := strings.TrimSpace(values.Get("date"))
+	if raw == "" {
+		return defaultJournalDate(), nil
+	}
+	parsed, err := time.Parse("2006-01-02", raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid journal date %q", raw)
+	}
+	return parsed, nil
+}
+
+func parseJournalNoteID(id string) (time.Time, bool) {
+	id = strings.TrimSpace(id)
+	parsed, err := time.Parse("2006-01-02", id)
+	if err != nil || parsed.Format("2006-01-02") != id {
+		return time.Time{}, false
+	}
+	return parsed, true
+}
+
+func buildJournalView(selectedDate time.Time, journalNotes map[string]webNoteSummary) webJournalView {
+	selectedDate = dateOnly(selectedDate)
+	currentMonth := startOfMonth(selectedDate)
+	firstGridDay := startOfWeek(currentMonth)
+	today := defaultJournalDate()
+
+	days := make([]webJournalDay, 0, 42)
+	for i := 0; i < 42; i++ {
+		day := firstGridDay.AddDate(0, 0, i)
+		id := day.Format("2006-01-02")
+		_, hasEntry := journalNotes[id]
+		days = append(days, webJournalDay{
+			Date:           id,
+			DayOfMonth:     day.Day(),
+			WeekdayLabel:   day.Format("Mon"),
+			IsCurrentMonth: day.Month() == currentMonth.Month(),
+			IsToday:        day.Equal(today),
+			IsSelected:     day.Equal(selectedDate),
+			HasEntry:       hasEntry,
+			BrowseURL:      journalURL(day),
+		})
+	}
+
+	entry, hasEntry := journalNotes[selectedDate.Format("2006-01-02")]
+	view := webJournalView{
+		MonthLabel:        currentMonth.Format("January 2006"),
+		SelectedDate:      selectedDate.Format("2006-01-02"),
+		SelectedDateLabel: selectedDate.Format("Monday, January 2, 2006"),
+		TodayURL:          journalURL(today),
+		PrevMonthURL:      journalURL(shiftMonth(selectedDate, -1)),
+		NextMonthURL:      journalURL(shiftMonth(selectedDate, 1)),
+		Days:              days,
+		HasEntry:          hasEntry,
+	}
+	if hasEntry {
+		view.SelectedNoteURL = entry.DetailURL
+	}
+	return view
+}
+
+func dateOnly(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func startOfMonth(t time.Time) time.Time {
+	t = dateOnly(t)
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC)
+}
+
+func startOfWeek(t time.Time) time.Time {
+	t = dateOnly(t)
+	offset := (int(t.Weekday()) + 6) % 7
+	return t.AddDate(0, 0, -offset)
+}
+
+func shiftMonth(t time.Time, delta int) time.Time {
+	t = dateOnly(t)
+	targetMonth := startOfMonth(t).AddDate(0, delta, 0)
+	lastDay := targetMonth.AddDate(0, 1, -1).Day()
+	day := t.Day()
+	if day > lastDay {
+		day = lastDay
+	}
+	return time.Date(targetMonth.Year(), targetMonth.Month(), day, 0, 0, 0, 0, time.UTC)
 }
 
 func formatOutgoingLinks(links []webLink) string {
@@ -3628,11 +3809,25 @@ func notebookPageTemplate() *template.Template {
     .history-panel { border:1px solid var(--line); border-radius:16px; padding:1rem; background:#fff; }
     .history-actions { display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:1rem; }
     .history-restore-form { margin:0; }
+    .journal-header { display:flex; justify-content:space-between; gap:1rem; align-items:flex-start; flex-wrap:wrap; }
+    .journal-nav { display:flex; gap:0.6rem; flex-wrap:wrap; }
+    .calendar-weekdays, .calendar-grid { display:grid; grid-template-columns:repeat(7, minmax(0, 1fr)); gap:0.55rem; }
+    .calendar-weekdays { margin-top:1.25rem; color:var(--muted); font-size:0.82rem; text-transform:uppercase; letter-spacing:0.08em; }
+    .calendar-grid { margin-top:0.6rem; }
+    .calendar-day { display:block; min-height:92px; padding:0.7rem; border:1px solid var(--line); border-radius:16px; background:#fff; text-decoration:none; }
+    .calendar-day:hover { border-color:var(--accent); transform:translateY(-1px); transition:160ms ease; }
+    .calendar-day.muted { opacity:0.45; }
+    .calendar-day.selected { border-color:var(--accent); background:var(--accent-soft); }
+    .calendar-day.today { box-shadow: inset 0 0 0 1px var(--accent); }
+    .calendar-day .meta { justify-content:space-between; align-items:flex-start; }
+    .calendar-dot { width:0.55rem; height:0.55rem; border-radius:999px; background:var(--accent); display:inline-block; }
+    .calendar-empty { color:var(--muted); font-size:0.85rem; margin-top:1.4rem; }
     @media (max-width: 880px) {
       .layout { grid-template-columns: 1fr; }
       .sidebar { border-right:none; border-bottom:1px solid var(--line); }
       .content { padding-top:1rem; }
       .history-layout { grid-template-columns: 1fr; }
+      .calendar-day { min-height:76px; }
     }
   </style>
 </head>
@@ -3675,6 +3870,7 @@ func notebookPageTemplate() *template.Template {
         <div class="toolbar">
           <a class="button secondary" href="/new">New note</a>
           <a class="button secondary" href="{{.TasksPageURL}}">Open tasks</a>
+          <a class="button secondary" href="{{.JournalPageURL}}">Journal</a>
         </div>
         <div class="note-list">
           {{range .Notes}}
@@ -3726,6 +3922,62 @@ func notebookPageTemplate() *template.Template {
               <a class="button secondary" href="{{.NoteForm.CancelURL}}">Cancel</a>
             </div>
           </form>
+        {{else if .Journal}}
+          <div class="eyebrow">Daily Notes</div>
+          <div class="journal-header">
+            <div>
+              <h1>{{.Journal.MonthLabel}}</h1>
+              <p>{{.Journal.SelectedDateLabel}}</p>
+            </div>
+            <div class="journal-nav">
+              <a class="button secondary" href="{{.Journal.PrevMonthURL}}">Previous month</a>
+              <a class="button secondary" href="{{.Journal.TodayURL}}">Today</a>
+              <a class="button secondary" href="{{.Journal.NextMonthURL}}">Next month</a>
+            </div>
+          </div>
+          <div class="calendar-weekdays">
+            <div>Mon</div>
+            <div>Tue</div>
+            <div>Wed</div>
+            <div>Thu</div>
+            <div>Fri</div>
+            <div>Sat</div>
+            <div>Sun</div>
+          </div>
+          <div class="calendar-grid">
+            {{range .Journal.Days}}
+              <a class="calendar-day {{if not .IsCurrentMonth}}muted{{end}} {{if .IsSelected}}selected{{end}} {{if .IsToday}}today{{end}}" href="{{.BrowseURL}}">
+                <div class="meta">
+                  <strong>{{.DayOfMonth}}</strong>
+                  {{if .HasEntry}}<span class="calendar-dot" title="Entry available"></span>{{end}}
+                </div>
+                <div class="calendar-empty">{{if .HasEntry}}Entry saved{{else}}No entry{{end}}</div>
+              </a>
+            {{end}}
+          </div>
+          <div class="section">
+            {{if .Journal.HasEntry}}
+              <div class="eyebrow">{{.CurrentNote.ID}}</div>
+              <h2>{{.CurrentNote.Title}}</h2>
+              <div class="meta">{{.CurrentNote.ModTime}}{{if .CurrentNote.Archived}} · <span class="archived">archived</span>{{end}}</div>
+              <div class="actions">
+                <a class="button secondary" href="{{.Journal.SelectedNoteURL}}">Open note page</a>
+                <a class="button secondary" href="{{noteEditURL .CurrentNote.ID}}">Edit note</a>
+              </div>
+              {{if .CurrentNote.Tags}}
+                <div class="meta" style="margin-top:0.75rem;">
+                  {{range .CurrentNote.Tags}}<span class="tag">#{{.}}</span>{{end}}
+                </div>
+              {{end}}
+              <div class="section">{{.CurrentNote.RenderedBody}}</div>
+            {{else}}
+              <h2>{{.Journal.SelectedDate}}</h2>
+              <p>No journal entry exists for this day yet.</p>
+              <div class="actions">
+                <a class="button secondary" href="/new">Create a note</a>
+              </div>
+            {{end}}
+          </div>
         {{else if .CurrentNote}}
           <div class="eyebrow">{{.CurrentNote.ID}}</div>
           <h1>{{.CurrentNote.Title}}</h1>

@@ -2209,7 +2209,7 @@ func TestServeIndexPageRendersTagFilterAndWarnings(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/?tag=work", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2250,7 +2250,7 @@ func TestServeIndexPageSearchMatchesBodyAndPreservesFiltersInLinks(t *testing.T)
 	req := httptest.NewRequest(http.MethodGet, "/?q=search&tags=work,writing", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2288,7 +2288,7 @@ func TestServeIndexPageCanShowArchivedOnlySearchResults(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/?q=search&archived=only", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2320,7 +2320,7 @@ func TestServeNotePageRendersBacklinksAndBrokenWarning(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/notes/alpha", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2353,7 +2353,7 @@ func TestServeNotePageReturnsNotFoundForMissingNote(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/notes/missing", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rec.Code)
@@ -2366,7 +2366,7 @@ func TestServeCreateNotePageRendersForm(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/new", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2398,7 +2398,7 @@ func TestServeTasksPageRendersGroupedOpenTasks(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/tasks?tag=work", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2445,7 +2445,7 @@ func TestServeToggleTaskPostUpdatesNoteAndRedirects(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
@@ -2478,7 +2478,7 @@ func TestServeTasksPageShowsEmptyState(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/tasks", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2501,7 +2501,7 @@ func TestServeCreateNotePostCreatesNote(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
@@ -2533,7 +2533,7 @@ func TestServeEditNotePageRendersExistingContent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/notes/alpha/edit", nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2573,7 +2573,7 @@ func TestServeUpdateNotePostEditsNote(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
@@ -2610,7 +2610,7 @@ func TestServeNoteHistoryPageRendersVersionsAndDiff(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/notes/alpha/history?version="+url.QueryEscape(versionID), nil)
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status: %d", rec.Code)
@@ -2651,7 +2651,7 @@ func TestServeRestoreNotePostRestoresSelectedVersion(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 
-	newServeMux().ServeHTTP(rec, req)
+	newTestServeMux(t).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusSeeOther {
 		t.Fatalf("expected redirect, got %d with body %q", rec.Code, rec.Body.String())
@@ -2667,6 +2667,88 @@ func TestServeRestoreNotePostRestoresSelectedVersion(t *testing.T) {
 	if string(got) != "# Alpha\n\nOld body.\n" {
 		t.Fatalf("unexpected restored content: %q", string(got))
 	}
+}
+
+func TestServeJournalPageRendersCalendarAndDailyEntry(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("2026-03-14"), []byte("# 2026-03-14\nTags: daily\n\n## Notes\n\nJournal body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("2026-03-10"), []byte("# 2026-03-10\nTags: daily\n\nEarlier entry.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/journal?date=2026-03-14", nil)
+	rec := httptest.NewRecorder()
+
+	newTestServeMux(t).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Journal") || !strings.Contains(body, "March 2026") {
+		t.Fatalf("expected journal heading, got %q", body)
+	}
+	if !strings.Contains(body, `href="/journal?date=2026-03-14"`) {
+		t.Fatalf("expected today navigation link, got %q", body)
+	}
+	if !strings.Contains(body, `href="/journal?date=2026-02-14"`) || !strings.Contains(body, `href="/journal?date=2026-04-14"`) {
+		t.Fatalf("expected month navigation links, got %q", body)
+	}
+	if !strings.Contains(body, `calendar-day`) || !strings.Contains(body, `selected`) {
+		t.Fatalf("expected selected calendar day, got %q", body)
+	}
+	if !strings.Contains(body, `calendar-dot`) {
+		t.Fatalf("expected entry marker in calendar, got %q", body)
+	}
+	if !strings.Contains(body, "Journal body.") {
+		t.Fatalf("expected selected daily note body, got %q", body)
+	}
+}
+
+func TestServeJournalPageShowsEmptyStateForMissingDate(t *testing.T) {
+	withTempDir(t)
+	setFixedNow(t, time.Date(2026, 3, 14, 9, 0, 0, 0, time.UTC))
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("2026-03-14"), []byte("# 2026-03-14\nTags: daily\n\nEntry.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/journal?date=2026-03-15", nil)
+	rec := httptest.NewRecorder()
+
+	newTestServeMux(t).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "No journal entry exists for this day yet.") {
+		t.Fatalf("expected empty journal state, got %q", body)
+	}
+	if strings.Contains(body, "Entry.</p>") {
+		t.Fatalf("expected missing date to avoid rendering another note, got %q", body)
+	}
+}
+
+func newTestServeMux(t *testing.T) http.Handler {
+	t.Helper()
+
+	serverState, err := newNotebookServer(false)
+	if err != nil {
+		t.Fatalf("newNotebookServer returned error: %v", err)
+	}
+	return newServeMux(serverState)
 }
 
 func withTempDir(t *testing.T) {
