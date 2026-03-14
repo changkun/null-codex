@@ -1,0 +1,3 @@
+{
+  "result": "Next goal: add a `serve` command that turns the existing Markdown notebook into a local browsable web UI with rendered notes, clickable `[[note-id]]` links, backlinks, tag filtering, and visible broken-link warnings."
+}

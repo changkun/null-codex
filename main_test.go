@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1304,6 +1306,36 @@ func TestExtractNoteLinksDeduplicatesAndPreservesOrder(t *testing.T) {
 	}
 }
 
+func TestRenderMarkdownHTMLLinksExistingAndBrokenNotes(t *testing.T) {
+	existing := map[string]struct{}{
+		"target": {},
+	}
+
+	got := string(renderMarkdownHTML("See [[target]] and [[missing]].", existing))
+
+	if !strings.Contains(got, `<a class="wiki-link" href="/notes/target">[[target]]</a>`) {
+		t.Fatalf("expected existing wiki link to render as anchor, got %q", got)
+	}
+	if !strings.Contains(got, `<span class="broken-link">[[missing]]</span>`) {
+		t.Fatalf("expected missing wiki link to render as warning span, got %q", got)
+	}
+}
+
+func TestParseServeOptions(t *testing.T) {
+	opts, err := parseServeOptions([]string{"--addr", ":9999"})
+	if err != nil {
+		t.Fatalf("parseServeOptions returned error: %v", err)
+	}
+	if opts.Addr != ":9999" {
+		t.Fatalf("unexpected addr: %q", opts.Addr)
+	}
+
+	_, err = parseServeOptions([]string{"--addr"})
+	if err == nil || err.Error() != "--addr requires a value" {
+		t.Fatalf("expected addr value error, got %v", err)
+	}
+}
+
 func TestViewNoteShowsLinksAndBacklinks(t *testing.T) {
 	withTempDir(t)
 
@@ -1493,6 +1525,98 @@ func TestRunIncludesLinksAndBacklinksCommands(t *testing.T) {
 	})
 	if backlinksOutput != "source\n" {
 		t.Fatalf("unexpected backlinks stdout: %q", backlinksOutput)
+	}
+}
+
+func TestServeIndexPageRendersTagFilterAndWarnings(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\n\nSee [[beta]] and [[missing]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("beta"), []byte("# Beta\nTags: home\n\nBack to [[alpha]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/?tag=work", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Alpha") {
+		t.Fatalf("expected filtered note in body, got %q", body)
+	}
+	if strings.Contains(body, "Beta</strong>") {
+		t.Fatalf("expected non-matching note to be filtered out, got %q", body)
+	}
+	if !strings.Contains(body, "#work") {
+		t.Fatalf("expected tag filter controls, got %q", body)
+	}
+	if !strings.Contains(body, "1 broken") {
+		t.Fatalf("expected broken-link summary in sidebar, got %q", body)
+	}
+}
+
+func TestServeNotePageRendersBacklinksAndBrokenWarning(t *testing.T) {
+	withTempDir(t)
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(notePath("alpha"), []byte("# Alpha\nTags: work\n\nSee [[beta]] and [[missing]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(notePath("beta"), []byte("# Beta\n\nBack to [[alpha]].\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/notes/alpha", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Broken links in this note") {
+		t.Fatalf("expected broken-link warning, got %q", body)
+	}
+	if !strings.Contains(body, `<a class="wiki-link" href="/notes/beta">[[beta]]</a>`) {
+		t.Fatalf("expected rendered outgoing wiki link, got %q", body)
+	}
+	if !strings.Contains(body, `<span class="broken-link">[[missing]]</span>`) {
+		t.Fatalf("expected rendered broken wiki link, got %q", body)
+	}
+	if !strings.Contains(body, `href="/notes/beta">beta</a>`) {
+		t.Fatalf("expected outgoing links section, got %q", body)
+	}
+	if !strings.Contains(body, `href="/notes/beta">beta</a>`) || !strings.Contains(body, "Backlinks") {
+		t.Fatalf("expected backlinks section, got %q", body)
+	}
+}
+
+func TestServeNotePageReturnsNotFoundForMissingNote(t *testing.T) {
+	withTempDir(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/notes/missing", nil)
+	rec := httptest.NewRecorder()
+
+	newServeMux().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
 	}
 }
 

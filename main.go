@@ -3,7 +3,11 @@ package main
 import (
 	"errors"
 	"fmt"
+	"html"
+	"html/template"
 	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +21,9 @@ import (
 const notesDir = "notes"
 
 var noteLinkPattern = regexp.MustCompile(`\[\[([^\[\]]+)\]\]`)
+var inlineCodePattern = regexp.MustCompile("`([^`]+)`")
+var boldPattern = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+var italicPattern = regexp.MustCompile(`\*([^*]+)\*`)
 
 var now = time.Now
 
@@ -50,6 +57,10 @@ type noteEdge struct {
 	Target string
 }
 
+type serveOptions struct {
+	Addr string
+}
+
 type doctorOptions struct {
 	Fix    bool
 	Report bool
@@ -75,6 +86,55 @@ type noteTemplate struct {
 	DefaultTitle func() string
 	DefaultTags  []string
 	Body         func(title string) string
+}
+
+type notebookPageData struct {
+	Title           string
+	HeaderTitle     string
+	HeaderSubtitle  string
+	ActiveTag       string
+	AvailableTags   []string
+	IncludeArchived bool
+	Notes           []webNoteSummary
+	CurrentNote     *webNoteDetail
+}
+
+type webNoteSummary struct {
+	ID           string
+	Title        string
+	Tags         []string
+	Archived     bool
+	ModTime      string
+	LinksCount   int
+	Backlinks    int
+	BrokenLinks  []string
+	DetailURL    string
+}
+
+type webNoteDetail struct {
+	ID                string
+	Title             string
+	Tags              []string
+	Archived          bool
+	ModTime           string
+	RenderedBody      template.HTML
+	OutgoingLinks     []webLink
+	Backlinks         []webLink
+	BrokenLinks       []string
+	OutgoingLinksText string
+}
+
+type webLink struct {
+	ID    string
+	Title string
+	URL   string
+}
+
+type notebookSnapshot struct {
+	Notes         []webNoteSummary
+	NotesByID     map[string]webNoteSummary
+	RenderedNotes map[string]webNoteDetail
+	Tags          []string
 }
 
 func main() {
@@ -117,6 +177,8 @@ func run(args []string) error {
 		return listNoteBacklinks(args[1:])
 	case "graph":
 		return graphNotes(args[1:])
+	case "serve":
+		return serveNotes(args[1:])
 	case "delete", "rm":
 		return deleteNote(args[1:])
 	case "doctor":
@@ -517,6 +579,99 @@ func graphNotes(args []string) error {
 	}
 	fmt.Println("}")
 	return nil
+}
+
+func serveNotes(args []string) error {
+	opts, err := parseServeOptions(args)
+	if err != nil {
+		return err
+	}
+
+	server := &http.Server{
+		Addr:    opts.Addr,
+		Handler: newServeMux(),
+	}
+
+	fmt.Printf("serving notebook at http://%s\n", normalizeServeAddr(opts.Addr))
+	return server.ListenAndServe()
+}
+
+func newServeMux() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", serveIndexPage)
+	mux.HandleFunc("/notes/", serveNotePage)
+	return mux
+}
+
+func serveIndexPage(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	snapshot, err := buildNotebookSnapshot()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data := notebookPageData{
+		Title:           "Notebook",
+		HeaderTitle:     "Notebook",
+		HeaderSubtitle:  notebookSubtitle(len(snapshot.Notes)),
+		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
+		AvailableTags:   snapshot.Tags,
+		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+	}
+
+	data.Notes = filterSnapshotNotes(snapshot.Notes, data.ActiveTag, data.IncludeArchived)
+	renderNotebookPage(w, data)
+}
+
+func serveNotePage(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/notes/")
+	id = strings.TrimSpace(strings.Trim(id, "/"))
+	unescapedID, err := url.PathUnescape(id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	id = unescapedID
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	snapshot, err := buildNotebookSnapshot()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	detail, ok := snapshot.RenderedNotes[id]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	data := notebookPageData{
+		Title:           detail.Title,
+		HeaderTitle:     detail.Title,
+		HeaderSubtitle:  id,
+		ActiveTag:       strings.TrimSpace(r.URL.Query().Get("tag")),
+		AvailableTags:   snapshot.Tags,
+		IncludeArchived: queryIncludesArchived(r.URL.Query()),
+		Notes:           filterSnapshotNotes(snapshot.Notes, strings.TrimSpace(r.URL.Query().Get("tag")), queryIncludesArchived(r.URL.Query())),
+		CurrentNote:     &detail,
+	}
+	renderNotebookPage(w, data)
+}
+
+func renderNotebookPage(w http.ResponseWriter, data notebookPageData) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := notebookPageTemplate().Execute(w, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func deleteNote(args []string) error {
@@ -1089,6 +1244,190 @@ func inspectNotebook(notes []noteMeta) ([]brokenLink, []string, error) {
 	return brokenLinks, orphanedNotes, nil
 }
 
+func buildNotebookSnapshot() (notebookSnapshot, error) {
+	notes, err := loadNotes()
+	if err != nil {
+		return notebookSnapshot{}, err
+	}
+
+	contents := make(map[string]noteContent, len(notes))
+	existing := make(map[string]struct{}, len(notes))
+	tagSet := make(map[string]struct{})
+	for _, note := range notes {
+		content, err := readNoteContent(notePath(note.ID))
+		if err != nil {
+			return notebookSnapshot{}, err
+		}
+		contents[note.ID] = content
+		existing[note.ID] = struct{}{}
+		for _, tag := range note.Tags {
+			tagSet[tag] = struct{}{}
+		}
+	}
+
+	backlinks := make(map[string][]webLink, len(notes))
+	for _, note := range notes {
+		for _, target := range extractNoteLinks(contents[note.ID].Body) {
+			if _, ok := existing[target]; !ok {
+				continue
+			}
+			backlinks[target] = append(backlinks[target], webLink{
+				ID:    note.ID,
+				Title: note.Title,
+				URL:   noteURL(note.ID),
+			})
+		}
+	}
+
+	var tags []string
+	for tag := range tagSet {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	snapshot := notebookSnapshot{
+		NotesByID:     make(map[string]webNoteSummary, len(notes)),
+		RenderedNotes: make(map[string]webNoteDetail, len(notes)),
+		Tags:          tags,
+	}
+	for _, note := range notes {
+		content := contents[note.ID]
+		links := extractNoteLinks(content.Body)
+		outgoing := buildOutgoingLinks(links, notes)
+		broken := collectBrokenTargets(links, existing)
+		currentBacklinks := append([]webLink(nil), backlinks[note.ID]...)
+		sort.Slice(currentBacklinks, func(i, j int) bool {
+			return currentBacklinks[i].ID < currentBacklinks[j].ID
+		})
+
+		summary := webNoteSummary{
+			ID:          note.ID,
+			Title:       note.Title,
+			Tags:        append([]string(nil), note.Tags...),
+			Archived:    note.Archived,
+			ModTime:     note.ModTime.Format(time.RFC3339),
+			LinksCount:  len(outgoing),
+			Backlinks:   len(currentBacklinks),
+			BrokenLinks: broken,
+			DetailURL:   noteURL(note.ID),
+		}
+		detail := webNoteDetail{
+			ID:                note.ID,
+			Title:             note.Title,
+			Tags:              append([]string(nil), note.Tags...),
+			Archived:          note.Archived,
+			ModTime:           note.ModTime.Format(time.RFC3339),
+			RenderedBody:      renderMarkdownHTML(content.Body, existing),
+			OutgoingLinks:     outgoing,
+			Backlinks:         currentBacklinks,
+			BrokenLinks:       broken,
+			OutgoingLinksText: formatOutgoingLinks(outgoing),
+		}
+
+		snapshot.Notes = append(snapshot.Notes, summary)
+		snapshot.NotesByID[note.ID] = summary
+		snapshot.RenderedNotes[note.ID] = detail
+	}
+
+	sort.Slice(snapshot.Notes, func(i, j int) bool {
+		if snapshot.Notes[i].ModTime == snapshot.Notes[j].ModTime {
+			return snapshot.Notes[i].ID < snapshot.Notes[j].ID
+		}
+		return snapshot.Notes[i].ModTime > snapshot.Notes[j].ModTime
+	})
+	return snapshot, nil
+}
+
+func buildOutgoingLinks(links []string, notes []noteMeta) []webLink {
+	var outgoing []webLink
+	for _, target := range links {
+		targetMeta := findNoteMeta(notes, target)
+		if targetMeta.ID == "" {
+			continue
+		}
+		outgoing = append(outgoing, webLink{
+			ID:    targetMeta.ID,
+			Title: targetMeta.Title,
+			URL:   noteURL(targetMeta.ID),
+		})
+	}
+	return outgoing
+}
+
+func collectBrokenTargets(links []string, existing map[string]struct{}) []string {
+	var broken []string
+	for _, target := range links {
+		if _, ok := existing[target]; ok {
+			continue
+		}
+		broken = append(broken, target)
+	}
+	return broken
+}
+
+func findNoteMeta(notes []noteMeta, id string) noteMeta {
+	for _, note := range notes {
+		if note.ID == id {
+			return note
+		}
+	}
+	return noteMeta{}
+}
+
+func filterSnapshotNotes(notes []webNoteSummary, tag string, includeArchived bool) []webNoteSummary {
+	var filtered []webNoteSummary
+	for _, note := range notes {
+		if tag != "" && !hasAllTags(note.Tags, []string{tag}) {
+			continue
+		}
+		if !includeArchived && note.Archived {
+			continue
+		}
+		filtered = append(filtered, note)
+	}
+	return filtered
+}
+
+func queryIncludesArchived(values url.Values) bool {
+	includeArchived := strings.TrimSpace(values.Get("archived"))
+	return includeArchived == "1" || strings.EqualFold(includeArchived, "true")
+}
+
+func noteURL(id string) string {
+	return "/notes/" + url.PathEscape(id)
+}
+
+func tagURL(tag string, includeArchived bool) string {
+	values := url.Values{}
+	values.Set("tag", tag)
+	if includeArchived {
+		values.Set("archived", "1")
+	}
+	return "/?" + values.Encode()
+}
+
+func clearTagURL(includeArchived bool) string {
+	if !includeArchived {
+		return "/"
+	}
+	return "/?archived=1"
+}
+
+func notebookSubtitle(count int) string {
+	return fmt.Sprintf("%d %s", count, pluralize(count, "note", "notes"))
+}
+
+func formatOutgoingLinks(links []webLink) string {
+	if len(links) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(links))
+	for _, link := range links {
+		parts = append(parts, link.ID)
+	}
+	return strings.Join(parts, ", ")
+}
+
 func parseDoctorOptions(args []string) (doctorOptions, error) {
 	var opts doctorOptions
 	for _, arg := range args {
@@ -1191,6 +1530,36 @@ func pluralize(count int, singular, plural string) string {
 		return singular
 	}
 	return plural
+}
+
+func parseServeOptions(args []string) (serveOptions, error) {
+	opts := serveOptions{Addr: "127.0.0.1:8080"}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--addr":
+			if i+1 >= len(args) {
+				return serveOptions{}, errors.New("--addr requires a value")
+			}
+			opts.Addr = strings.TrimSpace(args[i+1])
+			i++
+		case strings.HasPrefix(arg, "--addr="):
+			opts.Addr = strings.TrimSpace(strings.TrimPrefix(arg, "--addr="))
+		default:
+			return serveOptions{}, fmt.Errorf("unknown serve argument %q", arg)
+		}
+	}
+	if opts.Addr == "" {
+		return serveOptions{}, errors.New("serve address cannot be empty")
+	}
+	return opts, nil
+}
+
+func normalizeServeAddr(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "127.0.0.1" + addr
+	}
+	return addr
 }
 
 func dotQuote(value string) string {
@@ -1464,6 +1833,247 @@ func formatTags(tags []string) string {
 	return strings.Join(tags, ",")
 }
 
+func renderMarkdownHTML(body string, existing map[string]struct{}) template.HTML {
+	lines := strings.Split(body, "\n")
+	var b strings.Builder
+	inList := false
+	inCode := false
+
+	closeList := func() {
+		if inList {
+			b.WriteString("</ul>")
+			inList = false
+		}
+	}
+
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "```") {
+			closeList()
+			if inCode {
+				b.WriteString("</code></pre>")
+			} else {
+				b.WriteString("<pre><code>")
+			}
+			inCode = !inCode
+			continue
+		}
+
+		if inCode {
+			b.WriteString(html.EscapeString(raw))
+			b.WriteByte('\n')
+			continue
+		}
+
+		if trimmed == "" {
+			closeList()
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "### ") {
+			closeList()
+			b.WriteString("<h3>" + renderInlineMarkdown(strings.TrimSpace(trimmed[4:]), existing) + "</h3>")
+			continue
+		}
+		if strings.HasPrefix(trimmed, "## ") {
+			closeList()
+			b.WriteString("<h2>" + renderInlineMarkdown(strings.TrimSpace(trimmed[3:]), existing) + "</h2>")
+			continue
+		}
+		if strings.HasPrefix(trimmed, "# ") {
+			closeList()
+			b.WriteString("<h1>" + renderInlineMarkdown(strings.TrimSpace(trimmed[2:]), existing) + "</h1>")
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+			if !inList {
+				b.WriteString("<ul>")
+				inList = true
+			}
+			b.WriteString("<li>" + renderInlineMarkdown(strings.TrimSpace(trimmed[2:]), existing) + "</li>")
+			continue
+		}
+
+		closeList()
+		b.WriteString("<p>" + renderInlineMarkdown(trimmed, existing) + "</p>")
+	}
+
+	closeList()
+	if inCode {
+		b.WriteString("</code></pre>")
+	}
+	return template.HTML(b.String())
+}
+
+func renderInlineMarkdown(text string, existing map[string]struct{}) string {
+	text = html.EscapeString(text)
+	text = renderWikiLinks(text, existing)
+	text = inlineCodePattern.ReplaceAllString(text, "<code>$1</code>")
+	text = boldPattern.ReplaceAllString(text, "<strong>$1</strong>")
+	text = italicPattern.ReplaceAllString(text, "<em>$1</em>")
+	return text
+}
+
+func renderWikiLinks(text string, existing map[string]struct{}) string {
+	return noteLinkPattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := noteLinkPattern.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return match
+		}
+		target := strings.TrimSpace(parts[1])
+		if target == "" {
+			return match
+		}
+		label := "[[" + html.EscapeString(target) + "]]"
+		if _, ok := existing[target]; !ok {
+			return `<span class="broken-link">` + label + `</span>`
+		}
+		return `<a class="wiki-link" href="` + noteURL(target) + `">` + label + `</a>`
+	})
+}
+
+func notebookPageTemplate() *template.Template {
+	return template.Must(template.New("notebook").Funcs(template.FuncMap{
+		"tagURL":      tagURL,
+		"clearTagURL": clearTagURL,
+	}).Parse(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <style>
+    :root { color-scheme: light; --bg:#f4efe7; --card:#fffdf9; --ink:#1f1a17; --muted:#6c6258; --line:#d7cbbd; --accent:#0f766e; --accent-soft:#d6f0ed; --warn:#b42318; --warn-soft:#fde7e5; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: Georgia, "Times New Roman", serif; color:var(--ink); background:radial-gradient(circle at top, #fff8ef 0, var(--bg) 55%); }
+    a { color:inherit; }
+    .layout { display:grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); min-height:100vh; }
+    .sidebar { border-right:1px solid var(--line); padding:2rem 1.5rem; background:rgba(255,253,249,0.8); backdrop-filter: blur(8px); }
+    .content { padding:2rem; }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:18px; box-shadow:0 10px 30px rgba(60,35,15,0.08); }
+    .sidebar .panel { padding:1.25rem; }
+    .content .panel { padding:1.5rem 1.75rem; max-width:900px; }
+    h1, h2, h3 { font-weight:600; line-height:1.2; margin:0 0 0.75rem; }
+    p { line-height:1.65; margin:0 0 1rem; }
+    ul { margin:0 0 1rem 1.25rem; padding:0; }
+    pre { overflow:auto; background:#f8f3ec; padding:0.9rem; border-radius:12px; border:1px solid var(--line); }
+    code { font-family: "SFMono-Regular", Consolas, monospace; font-size:0.92em; }
+    .eyebrow { text-transform:uppercase; letter-spacing:0.08em; font-size:0.74rem; color:var(--muted); margin-bottom:0.4rem; }
+    .subtitle { color:var(--muted); margin-bottom:1.25rem; }
+    .note-list { display:grid; gap:0.85rem; margin-top:1.25rem; }
+    .note-item { display:block; padding:0.9rem 1rem; border-radius:14px; text-decoration:none; border:1px solid var(--line); background:#fff; }
+    .note-item:hover { border-color:var(--accent); transform:translateY(-1px); transition:160ms ease; }
+    .note-item strong { display:block; margin-bottom:0.25rem; }
+    .meta, .filters { display:flex; gap:0.4rem; flex-wrap:wrap; align-items:center; }
+    .meta { color:var(--muted); font-size:0.85rem; }
+    .tag, .filter-link { display:inline-flex; align-items:center; padding:0.25rem 0.55rem; border-radius:999px; border:1px solid var(--line); background:#fff; text-decoration:none; font-size:0.85rem; }
+    .filter-link.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .warning { margin:1rem 0; padding:0.85rem 1rem; border-radius:14px; border:1px solid #efb3ab; background:var(--warn-soft); color:var(--warn); }
+    .warning ul { margin-bottom:0; }
+    .wiki-link { color:var(--accent); text-decoration:none; font-weight:600; }
+    .broken-link { color:var(--warn); font-weight:600; background:var(--warn-soft); padding:0.05rem 0.25rem; border-radius:6px; }
+    .section { margin-top:1.5rem; padding-top:1.25rem; border-top:1px solid var(--line); }
+    .empty { color:var(--muted); font-style:italic; }
+    .archived { color:var(--warn); font-weight:600; }
+    .toolbar { margin:1rem 0 0; display:flex; gap:0.6rem; flex-wrap:wrap; }
+    .toggle { text-decoration:none; font-size:0.9rem; color:var(--accent); }
+    @media (max-width: 880px) {
+      .layout { grid-template-columns: 1fr; }
+      .sidebar { border-right:none; border-bottom:1px solid var(--line); }
+      .content { padding-top:1rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="panel">
+        <div class="eyebrow">Local notebook</div>
+        <h1>{{.HeaderTitle}}</h1>
+        <div class="subtitle">{{.HeaderSubtitle}}</div>
+        <div class="filters">
+          <a class="filter-link {{if eq .ActiveTag ""}}active{{end}}" href="{{clearTagURL .IncludeArchived}}">All</a>
+          {{range .AvailableTags}}
+            <a class="filter-link {{if eq $.ActiveTag .}}active{{end}}" href="{{tagURL . $.IncludeArchived}}">#{{.}}</a>
+          {{end}}
+        </div>
+        <div class="toolbar">
+          {{if .IncludeArchived}}
+            <a class="toggle" href="{{if .ActiveTag}}{{tagURL .ActiveTag false}}{{else}}/{{end}}">Hide archived</a>
+          {{else}}
+            <a class="toggle" href="{{if .ActiveTag}}{{tagURL .ActiveTag true}}{{else}}/?archived=1{{end}}">Show archived</a>
+          {{end}}
+        </div>
+        <div class="note-list">
+          {{range .Notes}}
+            <a class="note-item" href="{{.DetailURL}}">
+              <strong>{{.Title}}</strong>
+              <div class="meta">{{.ID}} · {{.ModTime}}</div>
+              <div class="meta">
+                {{if .Archived}}<span class="archived">archived</span>{{end}}
+                {{if .Tags}}{{range .Tags}}<span class="tag">#{{.}}</span>{{end}}{{end}}
+              </div>
+              <div class="meta">{{.LinksCount}} links · {{.Backlinks}} backlinks{{if .BrokenLinks}} · {{len .BrokenLinks}} broken{{end}}</div>
+            </a>
+          {{else}}
+            <div class="empty">No notes match this filter.</div>
+          {{end}}
+        </div>
+      </div>
+    </aside>
+    <main class="content">
+      <div class="panel">
+        {{if .CurrentNote}}
+          <div class="eyebrow">{{.CurrentNote.ID}}</div>
+          <h1>{{.CurrentNote.Title}}</h1>
+          <div class="meta">{{.CurrentNote.ModTime}}{{if .CurrentNote.Archived}} · <span class="archived">archived</span>{{end}}</div>
+          {{if .CurrentNote.Tags}}
+            <div class="meta" style="margin-top:0.75rem;">
+              {{range .CurrentNote.Tags}}<span class="tag">#{{.}}</span>{{end}}
+            </div>
+          {{end}}
+          {{if .CurrentNote.BrokenLinks}}
+            <div class="warning">
+              Broken links in this note:
+              <ul>
+                {{range .CurrentNote.BrokenLinks}}<li>[[{{.}}]] has no matching note.</li>{{end}}
+              </ul>
+            </div>
+          {{end}}
+          <div class="section">{{.CurrentNote.RenderedBody}}</div>
+          <div class="section">
+            <h2>Outgoing Links</h2>
+            {{if .CurrentNote.OutgoingLinks}}
+              <div class="filters">
+                {{range .CurrentNote.OutgoingLinks}}<a class="tag" href="{{.URL}}">{{.ID}}</a>{{end}}
+              </div>
+            {{else}}
+              <div class="empty">No outgoing wiki links.</div>
+            {{end}}
+          </div>
+          <div class="section">
+            <h2>Backlinks</h2>
+            {{if .CurrentNote.Backlinks}}
+              <div class="filters">
+                {{range .CurrentNote.Backlinks}}<a class="tag" href="{{.URL}}">{{.ID}}</a>{{end}}
+              </div>
+            {{else}}
+              <div class="empty">No backlinks yet.</div>
+            {{end}}
+          </div>
+        {{else}}
+          <div class="eyebrow">Notebook</div>
+          <h1>Rendered notes</h1>
+          <p>Select a note from the left to browse rendered Markdown, follow wiki links, inspect backlinks, and catch broken references.</p>
+        {{end}}
+      </div>
+    </main>
+  </div>
+</body>
+</html>`))
+}
+
 func builtInTemplates() map[string]noteTemplate {
 	return map[string]noteTemplate{
 		"daily": {
@@ -1582,6 +2192,7 @@ func printUsage() {
 	fmt.Println("  links <id>                List outgoing [[note-id]] links from a note")
 	fmt.Println("  backlinks <id>            List notes that link to a note")
 	fmt.Println("  graph                     Emit the notebook link graph as Graphviz DOT")
+	fmt.Println("  serve [--addr host:port]  Serve a local web UI for browsing rendered notes")
 	fmt.Println("  delete <id>               Delete a note")
 	fmt.Println("  doctor [--fix] [--report] Check for broken wiki links and orphaned notes")
 }
