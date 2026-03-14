@@ -1,0 +1,246 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+	"unicode"
+)
+
+const notesDir = "notes"
+
+type noteMeta struct {
+	ID      string
+	Title   string
+	ModTime time.Time
+}
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	if len(args) == 0 {
+		printUsage()
+		return nil
+	}
+
+	switch args[0] {
+	case "create", "new":
+		return createNote(args[1:])
+	case "list", "ls":
+		return listNotes()
+	case "view", "show":
+		return viewNote(args[1:])
+	case "delete", "rm":
+		return deleteNote(args[1:])
+	case "help", "-h", "--help":
+		printUsage()
+		return nil
+	default:
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func createNote(args []string) error {
+	if len(args) == 0 {
+		return errors.New("create requires a title")
+	}
+
+	title := strings.TrimSpace(args[0])
+	if title == "" {
+		return errors.New("title cannot be empty")
+	}
+
+	body := ""
+	if len(args) > 1 {
+		body = strings.Join(args[1:], " ")
+	}
+
+	if err := os.MkdirAll(notesDir, 0o755); err != nil {
+		return err
+	}
+
+	id, err := nextNoteID(title)
+	if err != nil {
+		return err
+	}
+
+	content := fmt.Sprintf("# %s\n\n", title)
+	if body != "" {
+		content += body + "\n"
+	}
+
+	path := notePath(id)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return err
+	}
+
+	fmt.Printf("created %s\n", id)
+	return nil
+}
+
+func listNotes() error {
+	entries, err := os.ReadDir(notesDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			fmt.Println("no notes found")
+			return nil
+		}
+		return err
+	}
+
+	var notes []noteMeta
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+
+		id := strings.TrimSuffix(entry.Name(), ".md")
+		title, err := readTitle(notePath(id))
+		if err != nil {
+			return err
+		}
+
+		notes = append(notes, noteMeta{
+			ID:      id,
+			Title:   title,
+			ModTime: info.ModTime(),
+		})
+	}
+
+	if len(notes) == 0 {
+		fmt.Println("no notes found")
+		return nil
+	}
+
+	sort.Slice(notes, func(i, j int) bool {
+		return notes[i].ModTime.After(notes[j].ModTime)
+	})
+
+	for _, note := range notes {
+		fmt.Printf("%s\t%s\t%s\n", note.ID, note.ModTime.Format(time.RFC3339), note.Title)
+	}
+
+	return nil
+}
+
+func viewNote(args []string) error {
+	if len(args) != 1 {
+		return errors.New("view requires a note id")
+	}
+
+	data, err := os.ReadFile(notePath(args[0]))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("note %q not found", args[0])
+		}
+		return err
+	}
+
+	fmt.Print(string(data))
+	return nil
+}
+
+func deleteNote(args []string) error {
+	if len(args) != 1 {
+		return errors.New("delete requires a note id")
+	}
+
+	path := notePath(args[0])
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("note %q not found", args[0])
+		}
+		return err
+	}
+
+	fmt.Printf("deleted %s\n", args[0])
+	return nil
+}
+
+func nextNoteID(title string) (string, error) {
+	base := slugify(title)
+	if base == "" {
+		base = "note"
+	}
+
+	id := base
+	for i := 1; ; i++ {
+		_, err := os.Stat(notePath(id))
+		if errors.Is(err, fs.ErrNotExist) {
+			return id, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		id = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
+func readTitle(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "# ")), nil
+		}
+		if line != "" {
+			return line, nil
+		}
+	}
+
+	return strings.TrimSuffix(filepath.Base(path), ".md"), nil
+}
+
+func notePath(id string) string {
+	return filepath.Join(notesDir, id+".md")
+}
+
+func slugify(input string) string {
+	var b strings.Builder
+	lastDash := false
+
+	for _, r := range strings.ToLower(strings.TrimSpace(input)) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsNumber(r):
+			b.WriteRune(r)
+			lastDash = false
+		case unicode.IsSpace(r) || r == '-' || r == '_':
+			if !lastDash && b.Len() > 0 {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+
+	return strings.Trim(b.String(), "-")
+}
+
+func printUsage() {
+	fmt.Println("notes <command> [arguments]")
+	fmt.Println("")
+	fmt.Println("Commands:")
+	fmt.Println("  create <title> [content]  Create a Markdown note")
+	fmt.Println("  list                      List saved notes")
+	fmt.Println("  view <id>                 Print a note")
+	fmt.Println("  delete <id>               Delete a note")
+}
